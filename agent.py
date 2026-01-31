@@ -1,7 +1,7 @@
 import os
 import io
 import hashlib
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -38,7 +38,7 @@ st.title("💬 IPR Agent — Pacotes por rota (IPR = Volume / Rotas)")
 
 st.caption(
     "IPR (oficial) = sum(PACOTES_COLETADOS_TOTAL) / COUNTD(FIRST_ROUTE_ID). "
-    "Escolha duas datas para comparar (A vs B)."
+    "Escolha dois períodos (A vs B) nas configurações."
 )
 
 # =========================
@@ -111,12 +111,16 @@ def calc_ipr(df: pd.DataFrame, volume_col: str, route_col: str, drop_null_routes
     return {"volume": volume, "rotas": float(rotas), "ipr": float(ipr)}
 
 
-def make_day_slice(df: pd.DataFrame, date_col: str, d: pd.Timestamp) -> pd.DataFrame:
+def make_range_slice(df: pd.DataFrame, date_col: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """
-    Recorte por dia (normaliza para meia-noite).
+    Recorte inclusivo por intervalo [start, end] (datas normalizadas).
     """
-    dn = pd.Timestamp(d).normalize()
-    return df[df[date_col].dt.normalize() == dn].copy()
+    s = pd.Timestamp(start).normalize()
+    e = pd.Timestamp(end).normalize()
+    if e < s:
+        s, e = e, s
+    mask = (df[date_col].dt.normalize() >= s) & (df[date_col].dt.normalize() <= e)
+    return df[mask].copy()
 
 
 def driver_decomposition_mix_perf(
@@ -270,25 +274,6 @@ B: volume={summary_B["volume"]:.0f}, rotas={summary_B["rotas"]:.0f}, ipr={fnum(s
 
 
 # =========================
-# Sidebar — Upload + Datas
-# (SEM mostrar API key e temperature)
-# =========================
-st.sidebar.header("Configurações")
-uploaded = st.sidebar.file_uploader("Envie sua base (.csv, .xlsx, .xls)", type=["csv", "xlsx", "xls"])
-
-# =========================
-# Session State
-# =========================
-if "df" not in st.session_state:
-    st.session_state.df = None
-if "df_id" not in st.session_state:
-    st.session_state.df_id = None
-if "agent" not in st.session_state:
-    st.session_state.agent = None
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# =========================
 # API Key e Modelo (somente via Secrets/env)
 # =========================
 api_key = ""
@@ -314,33 +299,86 @@ if not api_key:
     st.stop()
 
 # =========================
+# Sidebar — Configurações
+# =========================
+st.sidebar.header("Configurações")
+uploaded = st.sidebar.file_uploader("Envie sua base (.csv, .xlsx, .xls)", type=["csv", "xlsx", "xls"])
+
+# =========================
+# Session State
+# =========================
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "df_id" not in st.session_state:
+    st.session_state.df_id = None
+if "agent" not in st.session_state:
+    st.session_state.agent = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# =========================
 # Load Data
+# =========================
+if uploaded is None:
+    st.info("Envie o arquivo na barra lateral para começar.")
+    st.stop()
+
+raw = uploaded.getvalue()
+df_id = file_sha256(raw)
+
+if st.session_state.df is None or st.session_state.df_id != df_id:
+    df = read_uploaded_dataframe(uploaded)
+    st.session_state.df = df
+    st.session_state.df_id = df_id
+    st.session_state.agent = None  # recria agente quando DF muda
+
+df = st.session_state.df
+df = ensure_datetime(df, METRICS_POLICY["date_col"])
+df = ensure_week_iso(df, METRICS_POLICY["date_col"], METRICS_POLICY["week_col"])
+st.session_state.df = df
+
+# Valida coluna de data
+date_col = METRICS_POLICY["date_col"]
+if date_col not in df.columns or not df[date_col].notna().any():
+    st.error(f"Coluna de data '{date_col}' não encontrada ou inválida.")
+    st.stop()
+
+min_date = df[date_col].min().date()
+max_date = df[date_col].max().date()
+
+# =========================
+# Sidebar — Datas de comparação (RANGES)
+# =========================
+st.sidebar.subheader("Datas de comparação (ranges)")
+
+# Defaults: A = últimos 7 dias, B = 7 dias anteriores
+default_A_end = max_date
+default_A_start = (pd.Timestamp(max_date) - pd.Timedelta(days=6)).date()
+if default_A_start < min_date:
+    default_A_start = min_date
+
+default_B_end = (pd.Timestamp(default_A_start) - pd.Timedelta(days=1)).date()
+default_B_start = (pd.Timestamp(default_B_end) - pd.Timedelta(days=6)).date()
+if default_B_end < min_date:
+    default_B_end = min_date
+if default_B_start < min_date:
+    default_B_start = min_date
+
+st.sidebar.markdown("**Período A**")
+A_start = st.sidebar.date_input("Início A", value=default_A_start, min_value=min_date, max_value=max_date, key="A_start")
+A_end = st.sidebar.date_input("Fim A", value=default_A_end, min_value=min_date, max_value=max_date, key="A_end")
+
+st.sidebar.markdown("**Período B**")
+B_start = st.sidebar.date_input("Início B", value=default_B_start, min_value=min_date, max_value=max_date, key="B_start")
+B_end = st.sidebar.date_input("Fim B", value=default_B_end, min_value=min_date, max_value=max_date, key="B_end")
+
+# =========================
+# Main Layout
 # =========================
 left, right = st.columns([1, 1])
 
 with left:
     st.subheader("📦 Base carregada")
-
-    if uploaded is None:
-        st.info("Envie o arquivo na barra lateral para começar.")
-        st.stop()
-
-    raw = uploaded.getvalue()
-    df_id = file_sha256(raw)
-
-    if st.session_state.df is None or st.session_state.df_id != df_id:
-        df = read_uploaded_dataframe(uploaded)
-        st.session_state.df = df
-        st.session_state.df_id = df_id
-        st.session_state.agent = None  # recria agente quando DF muda
-
-    df = st.session_state.df
-
-    # Normalizações
-    df = ensure_datetime(df, METRICS_POLICY["date_col"])
-    df = ensure_week_iso(df, METRICS_POLICY["date_col"], METRICS_POLICY["week_col"])
-    st.session_state.df = df
-
     st.write(f"Linhas: **{len(df):,}** | Colunas: **{df.shape[1]}**")
 
     with st.expander("Ver colunas"):
@@ -348,43 +386,20 @@ with left:
 
     st.dataframe(df.head(50), use_container_width=True)
 
-    # Datas disponíveis
-    date_col = METRICS_POLICY["date_col"]
-    if date_col not in df.columns or not df[date_col].notna().any():
-        st.warning(f"Coluna de data '{date_col}' não encontrada ou inválida.")
-        st.stop()
-
-    min_date = df[date_col].min().date()
-    max_date = df[date_col].max().date()
-
-    st.markdown("### 📅 Datas de comparação")
-    colA, colB = st.columns(2)
-
-    with colA:
-        date_A = st.date_input("Data A", value=max_date, min_value=min_date, max_value=max_date, key="date_A")
-    with colB:
-        # default: D-7 (se existir), senão min_date
-        default_b = (pd.Timestamp(max_date) - pd.Timedelta(days=7)).date()
-        if default_b < min_date:
-            default_b = min_date
-        date_B = st.date_input("Data B", value=default_b, min_value=min_date, max_value=max_date, key="date_B")
-
 with right:
     st.subheader("📊 Comparação A vs B (prévia)")
 
-    df = st.session_state.df
-    date_col = METRICS_POLICY["date_col"]
+    # Recortes por intervalo (inclusive)
+    A = make_range_slice(df, date_col, pd.Timestamp(A_start), pd.Timestamp(A_end))
+    B = make_range_slice(df, date_col, pd.Timestamp(B_start), pd.Timestamp(B_end))
 
-    # Recortes por dia usando os dois calendários
-    A = make_day_slice(df, date_col, pd.Timestamp(date_A))
-    B = make_day_slice(df, date_col, pd.Timestamp(date_B))
-
-    label_A = pd.Timestamp(date_A).strftime("%Y-%m-%d")
-    label_B = pd.Timestamp(date_B).strftime("%Y-%m-%d")
+    label_A = f"{pd.Timestamp(A_start).strftime('%Y-%m-%d')} → {pd.Timestamp(A_end).strftime('%Y-%m-%d')}"
+    label_B = f"{pd.Timestamp(B_start).strftime('%Y-%m-%d')} → {pd.Timestamp(B_end).strftime('%Y-%m-%d')}"
 
     volume_col = METRICS_POLICY["volume_col"]
     route_col = METRICS_POLICY["route_col"]
 
+    # Warnings
     warnings = []
     if volume_col not in df.columns:
         warnings.append(f"Falta coluna de volume: {volume_col}")
@@ -407,6 +422,7 @@ with right:
     for w in warnings:
         st.warning(w)
 
+    # Métricas A e B
     summary_A = calc_ipr(A, volume_col, route_col, drop_null_routes=METRICS_POLICY["guardrails"]["drop_null_routes"])
     summary_B = calc_ipr(B, volume_col, route_col, drop_null_routes=METRICS_POLICY["guardrails"]["drop_null_routes"])
 
@@ -444,7 +460,7 @@ with right:
 # Chat
 # =========================
 st.divider()
-st.subheader("💬 Chat com o agente (consciente do IPR e das datas A/B)")
+st.subheader("💬 Chat com o agente (consciente dos períodos A/B)")
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
@@ -464,7 +480,6 @@ if user_question:
             temperature=DEFAULT_TEMPERATURE,  # fixo
         )
 
-        # allow_dangerous_code=True: o agente pode executar Python.
         st.session_state.agent = create_pandas_dataframe_agent(
             llm,
             st.session_state.df,
