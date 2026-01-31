@@ -1,7 +1,7 @@
 import os
 import io
 import hashlib
-from typing import List, Dict, Any, Optional
+from typing import List, Dict
 
 import pandas as pd
 import streamlit as st
@@ -10,9 +10,11 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
 
+# Carrega .env local (útil fora do Streamlit Cloud)
 load_dotenv()
 
 st.set_page_config(page_title="Chat com sua base (Pandas Agent)", layout="wide")
+
 
 # ----------------------------
 # Helpers
@@ -20,48 +22,55 @@ st.set_page_config(page_title="Chat com sua base (Pandas Agent)", layout="wide")
 def file_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
+
 def load_dataframe(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     raw = uploaded_file.getvalue()
 
     if name.endswith(".csv"):
-        # tenta utf-8, se falhar cai pra latin-1
+        # tenta utf-8; se falhar, cai pra latin-1
         try:
             return pd.read_csv(io.BytesIO(raw))
         except UnicodeDecodeError:
             return pd.read_csv(io.BytesIO(raw), encoding="latin-1")
-    elif name.endswith(".xlsx") or name.endswith(".xls"):
+
+    if name.endswith(".xlsx") or name.endswith(".xls"):
         return pd.read_excel(io.BytesIO(raw))
-    else:
-        raise ValueError("Formato não suportado. Envie .csv, .xlsx ou .xls")
+
+    raise ValueError("Formato não suportado. Envie .csv, .xlsx ou .xls")
+
 
 def format_history(messages: List[Dict[str, str]], max_turns: int = 6) -> str:
     """
     Converte histórico do chat em texto para dar contexto ao agente.
     Mantém poucas interações para não inflar o prompt.
     """
-    trimmed = messages[-max_turns*2:]  # user+assistant por turno
+    trimmed = messages[-max_turns * 2 :]  # user+assistant por turno
     lines = []
     for m in trimmed:
         role = "Usuário" if m["role"] == "user" else "Assistente"
         lines.append(f"{role}: {m['content']}")
     return "\n".join(lines).strip()
 
+
 def run_agent(agent, user_question: str, messages: List[Dict[str, str]]) -> str:
     history_txt = format_history(messages)
+
+    base_instructions = (
+        "Você é um analista de dados. Responda em português (Brasil).\n"
+        "Use o dataframe carregado para calcular e validar resultados.\n"
+        "Quando fizer contas, explique o raciocínio e mostre números-chave.\n"
+        "Se a pergunta for ambígua, faça uma suposição razoável e diga qual foi.\n"
+    )
+
     if history_txt:
         prompt = (
-            "Você é um analista de dados. Responda em português (Brasil).\n"
-            "Use o dataframe carregado para calcular e validar resultados.\n\n"
+            f"{base_instructions}\n"
             f"HISTÓRICO RECENTE:\n{history_txt}\n\n"
             f"PERGUNTA ATUAL:\n{user_question}"
         )
     else:
-        prompt = (
-            "Você é um analista de dados. Responda em português (Brasil).\n"
-            "Use o dataframe carregado para calcular e validar resultados.\n\n"
-            f"PERGUNTA:\n{user_question}"
-        )
+        prompt = f"{base_instructions}\nPERGUNTA:\n{user_question}"
 
     result = agent.invoke(prompt)
 
@@ -70,31 +79,53 @@ def run_agent(agent, user_question: str, messages: List[Dict[str, str]]) -> str:
         return result.get("output") or result.get("final") or str(result)
     return str(result)
 
+
 # ----------------------------
-# UI - Sidebar
+# Sidebar - Configurações
 # ----------------------------
 st.sidebar.header("Configurações")
 
+# Lê do Streamlit Secrets primeiro, depois env, depois vazio
+default_api_key = ""
+try:
+    default_api_key = st.secrets.get("OPENAI_API_KEY", "")
+except Exception:
+    default_api_key = ""
+
+if not default_api_key:
+    default_api_key = os.getenv("OPENAI_API_KEY", "")
+
 api_key = st.sidebar.text_input(
     "OPENAI_API_KEY",
-    value=os.getenv("OPENAI_API_KEY", ""),
+    value=default_api_key,
     type="password",
-    help="Você pode definir via variável de ambiente OPENAI_API_KEY ou colar aqui."
+    help="Defina em Secrets (recomendado) ou via variável de ambiente OPENAI_API_KEY.",
 )
 
+default_model = "gpt-3.5-turbo-0613"
+try:
+    default_model = st.secrets.get("OPENAI_MODEL", default_model)
+except Exception:
+    pass
+
 model_name = st.sidebar.text_input(
-    "Modelo (ex.: gpt-5-mini ou gpt-4.1-mini)",
-    value="gpt-5-mini",
-    help="Consulte a lista de modelos na doc da OpenAI."
+    "Modelo",
+    value=default_model,
+    help='Ex.: "gpt-3.5-turbo-0613"',
 )
 
 temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
 
 st.sidebar.divider()
+
 uploaded = st.sidebar.file_uploader(
     "Envie sua base (.csv, .xlsx, .xls)",
-    type=["csv", "xlsx", "xls"]
+    type=["csv", "xlsx", "xls"],
 )
+
+if st.sidebar.button("Limpar conversa"):
+    st.session_state.pop("messages", None)
+
 
 # ----------------------------
 # Estado
@@ -111,6 +142,7 @@ if "df_id" not in st.session_state:
 if "agent" not in st.session_state:
     st.session_state.agent = None
 
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -120,6 +152,7 @@ col1, col2 = st.columns([1, 1])
 
 with col1:
     st.subheader("Base carregada")
+
     if uploaded is None:
         st.info("Envie um arquivo na barra lateral para começar.")
     else:
@@ -136,11 +169,20 @@ with col1:
 
             st.session_state.df = df
             st.session_state.df_id = df_id
-            st.session_state.agent = None  # força recriação do agente
+            st.session_state.agent = None  # força recriação do agente (DF novo)
 
         df = st.session_state.df
         st.write(f"Linhas: **{len(df):,}** | Colunas: **{df.shape[1]}**")
+
+        with st.expander("Ver colunas"):
+            st.write(list(df.columns))
+
         st.dataframe(df.head(50), use_container_width=True)
+
+        st.caption(
+            "Dica: pergunte coisas como 'sumarize as colunas', 'total por categoria', "
+            "'top 10 por valor', 'filtre por data', etc."
+        )
 
 with col2:
     st.subheader("Chat")
@@ -151,11 +193,13 @@ with col2:
             st.markdown(m["content"])
 
     # Input do usuário
-    user_question = st.chat_input("Pergunte algo sobre sua base (ex.: 'qual a soma de vendas por estado?')")
+    user_question = st.chat_input(
+        "Pergunte algo sobre sua base (ex.: 'qual a soma de vendas por estado?')"
+    )
 
     if user_question:
         if not api_key:
-            st.error("Defina sua OPENAI_API_KEY na barra lateral (ou via variável de ambiente).")
+            st.error("Defina sua OPENAI_API_KEY (Secrets ou sidebar).")
             st.stop()
 
         if st.session_state.df is None:
@@ -175,11 +219,13 @@ with col2:
                 temperature=temperature,
             )
 
-            # IMPORTANTE: opt-in para execução de código
+            # IMPORTANTE:
+            # - allow_dangerous_code=True permite execução de Python pelo agente (risco).
+            # - use apenas com arquivos confiáveis e, idealmente, em ambiente isolado.
             st.session_state.agent = create_pandas_dataframe_agent(
                 llm,
                 st.session_state.df,
-                agent_type="tool-calling",
+                agent_type="openai-functions",  # bom para gpt-3.5-turbo-0613
                 verbose=False,
                 allow_dangerous_code=True,
             )
@@ -188,18 +234,25 @@ with col2:
         with st.chat_message("assistant"):
             with st.spinner("Analisando..."):
                 try:
-                    answer = run_agent(st.session_state.agent, user_question, st.session_state.messages)
+                    answer = run_agent(
+                        st.session_state.agent,
+                        user_question,
+                        st.session_state.messages,
+                    )
                 except Exception as e:
                     answer = (
                         "Deu erro ao executar a análise.\n\n"
                         f"**Detalhes:** {e}\n\n"
-                        "Dicas: tente uma pergunta mais específica (nome de colunas, filtros) "
-                        "ou verifique o modelo configurado."
+                        "Tente:\n"
+                        "- checar se o modelo existe/está liberado na sua conta\n"
+                        "- fazer uma pergunta mais específica (com nomes de colunas)\n"
+                        "- validar se o arquivo carregou corretamente\n"
                     )
             st.markdown(answer)
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
 
 st.caption(
-    "Nota: este agente executa Python para responder perguntas sobre o DataFrame. Use com cautela e apenas com dados confiáveis."
+    "Nota: este agente pode executar Python para responder perguntas sobre o DataFrame. "
+    "Use com cautela e apenas com dados confiáveis."
 )
