@@ -5,3 +5,4 @@ langchain
 langchain-openai
 langchain-experimental
 python-dotenv
+tabulate
