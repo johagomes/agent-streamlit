@@ -1,7 +1,7 @@
 import os
 import io
 import hashlib
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -26,13 +26,8 @@ METRICS_POLICY = {
     },
 }
 
-COMPARISON_LABELS = {
-    "day_vs_day-1": "Dia vs dia anterior (D vs D-1)",
-    "day_vs_d-7": "Dia vs D-7 (D vs D-7)",
-    "week_vs_week-1": "Semana vs semana-1 (W vs W-1)",
-}
-
 DEFAULT_MODEL = "gpt-3.5-turbo"
+DEFAULT_TEMPERATURE = 0.0  # fixo (não aparece na UI)
 
 # =========================
 # App Setup
@@ -43,7 +38,7 @@ st.title("💬 IPR Agent — Pacotes por rota (IPR = Volume / Rotas)")
 
 st.caption(
     "IPR (oficial) = sum(PACOTES_COLETADOS_TOTAL) / COUNTD(FIRST_ROUTE_ID). "
-    "Você pode alternar o modo de comparação no menu lateral."
+    "Escolha duas datas para comparar (A vs B)."
 )
 
 # =========================
@@ -103,10 +98,7 @@ def safe_nunique(series: pd.Series) -> int:
 
 def calc_ipr(df: pd.DataFrame, volume_col: str, route_col: str, drop_null_routes: bool = True) -> Dict[str, float]:
     """
-    Retorna componentes do IPR:
-    - volume = sum(volume_col)
-    - rotas  = nunique(route_col)
-    - ipr    = volume / rotas
+    IPR = sum(volume_col) / nunique(route_col)
     """
     dfx = df
     if drop_null_routes and route_col in dfx.columns:
@@ -119,51 +111,12 @@ def calc_ipr(df: pd.DataFrame, volume_col: str, route_col: str, drop_null_routes
     return {"volume": volume, "rotas": float(rotas), "ipr": float(ipr)}
 
 
-def iso_week_of_date(d: pd.Timestamp) -> Tuple[int, int]:
-    iso = pd.Timestamp(d).isocalendar()
-    return int(iso.year), int(iso.week)
-
-
-def prev_iso_week(year: int, week: int) -> Tuple[int, int]:
-    monday = pd.Timestamp.fromisocalendar(year, week, 1)
-    prev = monday - pd.Timedelta(days=7)
-    return iso_week_of_date(prev)
-
-
-def make_period_slices(
-    df: pd.DataFrame,
-    comparison_mode: str,
-    ref_date: pd.Timestamp,
-    date_col: str,
-    week_col: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame, str, str]:
+def make_day_slice(df: pd.DataFrame, date_col: str, d: pd.Timestamp) -> pd.DataFrame:
     """
-    Cria recortes A e B e também retorna labels legíveis.
+    Recorte por dia (normaliza para meia-noite).
     """
-    if comparison_mode in ("day_vs_day-1", "day_vs_d-7"):
-        dA = pd.Timestamp(ref_date).normalize()
-        delta = 1 if comparison_mode == "day_vs_day-1" else 7
-        dB = (pd.Timestamp(ref_date) - pd.Timedelta(days=delta)).normalize()
-
-        A = df[df[date_col].dt.normalize() == dA].copy()
-        B = df[df[date_col].dt.normalize() == dB].copy()
-
-        label_A = dA.strftime("%Y-%m-%d")
-        label_B = dB.strftime("%Y-%m-%d")
-        return A, B, label_A, label_B
-
-    if comparison_mode == "week_vs_week-1":
-        yA, wA = iso_week_of_date(pd.Timestamp(ref_date))
-        yB, wB = prev_iso_week(yA, wA)
-
-        wkA = f"{yA}/{str(wA).zfill(2)}"
-        wkB = f"{yB}/{str(wB).zfill(2)}"
-
-        A = df[df[week_col] == wkA].copy()
-        B = df[df[week_col] == wkB].copy()
-        return A, B, wkA, wkB
-
-    raise ValueError("comparison_mode inválido")
+    dn = pd.Timestamp(d).normalize()
+    return df[df[date_col].dt.normalize() == dn].copy()
 
 
 def driver_decomposition_mix_perf(
@@ -176,7 +129,7 @@ def driver_decomposition_mix_perf(
 ) -> pd.DataFrame:
     """
     Decomposição ΔIPR ≈ Δmix + Δperf por dimensão dim.
-    Retorna stats e contribuições por grupo.
+    w = share de rotas, r = IPR do grupo.
     """
     def prep(df: pd.DataFrame) -> pd.DataFrame:
         dfx = df
@@ -231,7 +184,6 @@ def format_history(messages: List[Dict[str, str]], max_turns: int = 6) -> str:
 
 def build_agent_prompt(
     user_question: str,
-    comparison_mode: str,
     label_A: str,
     label_B: str,
     summary_A: Dict[str, float],
@@ -276,9 +228,7 @@ A métrica OFICIAL é:
 - Rotas  = COUNTD({METRICS_POLICY["route_col"]}) = nunique({METRICS_POLICY["route_col"]})
 - IPR    = Volume / Rotas  (Pacotes por rota)
 
-MODO DE COMPARAÇÃO (já escolhido pelo usuário):
-- {COMPARISON_LABELS[comparison_mode]}
-Períodos:
+COMPARAÇÃO (já escolhida pelo usuário):
 - A = {label_A}
 - B = {label_B}
 
@@ -301,7 +251,7 @@ Use esses números como base e só calcule algo adicional se a pergunta pedir ex
 """.strip()
 
     def fnum(x: float) -> str:
-        if x != x:  # NaN
+        if x != x:
             return "NaN"
         return f"{x:,.4f}"
 
@@ -312,59 +262,19 @@ B: volume={summary_B["volume"]:.0f}, rotas={summary_B["rotas"]:.0f}, ipr={fnum(s
 ΔIPR = {fnum(summary_A["ipr"] - summary_B["ipr"])}
 """.strip()
 
-    prompt_parts = [sop, summary_block, "DRIVERS (Top 5 por dimensão):", driver_block]
-
+    parts = [sop, summary_block, "DRIVERS (Top 5 por dimensão):", driver_block]
     if history_txt:
-        prompt_parts.append("\nHISTÓRICO RECENTE:\n" + history_txt)
-
-    prompt_parts.append("\nPERGUNTA DO USUÁRIO:\n" + user_question)
-
-    return "\n\n".join(prompt_parts).strip()
+        parts.append("\nHISTÓRICO RECENTE:\n" + history_txt)
+    parts.append("\nPERGUNTA DO USUÁRIO:\n" + user_question)
+    return "\n\n".join(parts).strip()
 
 
 # =========================
-# Sidebar — OpenAI + Upload
+# Sidebar — Upload + Datas
+# (SEM mostrar API key e temperature)
 # =========================
 st.sidebar.header("Configurações")
-
-# API Key via Secrets (TOML) + fallback env + sidebar
-default_api_key = ""
-try:
-    default_api_key = st.secrets.get("OPENAI_API_KEY", "")
-except Exception:
-    default_api_key = ""
-
-if not default_api_key:
-    default_api_key = os.getenv("OPENAI_API_KEY", "")
-
-api_key = st.sidebar.text_input(
-    "OPENAI_API_KEY",
-    value=default_api_key,
-    type="password",
-    help="Recomendado: definir em Secrets (TOML): OPENAI_API_KEY = \"...\"",
-)
-
-# Modelo fixo (gpt-3.5-turbo) com possibilidade de override via Secrets opcional
-model_name = DEFAULT_MODEL
-try:
-    model_name = st.secrets.get("OPENAI_MODEL", DEFAULT_MODEL)
-except Exception:
-    model_name = DEFAULT_MODEL
-
-temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
-
-st.sidebar.divider()
 uploaded = st.sidebar.file_uploader("Envie sua base (.csv, .xlsx, .xls)", type=["csv", "xlsx", "xls"])
-
-st.sidebar.divider()
-comparison_mode = st.sidebar.selectbox(
-    "Modo de comparação",
-    options=list(COMPARISON_LABELS.keys()),
-    format_func=lambda k: COMPARISON_LABELS[k],
-    index=1,  # default: D vs D-7
-)
-
-st.sidebar.caption("Dica: D vs D-7 controla sazonalidade de dia da semana.")
 
 # =========================
 # Session State
@@ -377,6 +287,31 @@ if "agent" not in st.session_state:
     st.session_state.agent = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+# =========================
+# API Key e Modelo (somente via Secrets/env)
+# =========================
+api_key = ""
+try:
+    api_key = st.secrets.get("OPENAI_API_KEY", "")
+except Exception:
+    api_key = ""
+
+if not api_key:
+    api_key = os.getenv("OPENAI_API_KEY", "")
+
+model_name = DEFAULT_MODEL
+try:
+    model_name = st.secrets.get("OPENAI_MODEL", DEFAULT_MODEL)
+except Exception:
+    model_name = DEFAULT_MODEL
+
+if not api_key:
+    st.error(
+        "OPENAI_API_KEY não encontrada. Defina no Streamlit Secrets (TOML) ou como variável de ambiente.\n\n"
+        'Ex.: OPENAI_API_KEY = "sua-chave"'
+    )
+    st.stop()
 
 # =========================
 # Load Data
@@ -413,34 +348,39 @@ with left:
 
     st.dataframe(df.head(50), use_container_width=True)
 
-    # Data de referência
+    # Datas disponíveis
     date_col = METRICS_POLICY["date_col"]
-    if date_col in df.columns and df[date_col].notna().any():
-        min_date = df[date_col].min().date()
-        max_date = df[date_col].max().date()
-        ref_date = st.date_input(
-            "Data de referência (para comparação)",
-            value=max_date,
-            min_value=min_date,
-            max_value=max_date,
-        )
-        ref_date_ts = pd.Timestamp(ref_date)
-    else:
+    if date_col not in df.columns or not df[date_col].notna().any():
         st.warning(f"Coluna de data '{date_col}' não encontrada ou inválida.")
         st.stop()
 
+    min_date = df[date_col].min().date()
+    max_date = df[date_col].max().date()
+
+    st.markdown("### 📅 Datas de comparação")
+    colA, colB = st.columns(2)
+
+    with colA:
+        date_A = st.date_input("Data A", value=max_date, min_value=min_date, max_value=max_date, key="date_A")
+    with colB:
+        # default: D-7 (se existir), senão min_date
+        default_b = (pd.Timestamp(max_date) - pd.Timedelta(days=7)).date()
+        if default_b < min_date:
+            default_b = min_date
+        date_B = st.date_input("Data B", value=default_b, min_value=min_date, max_value=max_date, key="date_B")
+
 with right:
     st.subheader("📊 Comparação A vs B (prévia)")
-    df = st.session_state.df
 
-    # Recortes A e B
-    A, B, label_A, label_B = make_period_slices(
-        df=df,
-        comparison_mode=comparison_mode,
-        ref_date=ref_date_ts,
-        date_col=METRICS_POLICY["date_col"],
-        week_col=METRICS_POLICY["week_col"],
-    )
+    df = st.session_state.df
+    date_col = METRICS_POLICY["date_col"]
+
+    # Recortes por dia usando os dois calendários
+    A = make_day_slice(df, date_col, pd.Timestamp(date_A))
+    B = make_day_slice(df, date_col, pd.Timestamp(date_B))
+
+    label_A = pd.Timestamp(date_A).strftime("%Y-%m-%d")
+    label_B = pd.Timestamp(date_B).strftime("%Y-%m-%d")
 
     volume_col = METRICS_POLICY["volume_col"]
     route_col = METRICS_POLICY["route_col"]
@@ -479,8 +419,9 @@ with right:
     c2.metric("Volume (A)", f"{summary_A['volume']:.0f}", delta=f"{delta_vol:+.0f}")
     c3.metric("Rotas (A)", f"{summary_A['rotas']:.0f}", delta=f"{delta_rot:+.0f}")
 
-    st.caption(f"A = **{label_A}** | B = **{label_B}** | Modo: **{COMPARISON_LABELS[comparison_mode]}**")
+    st.caption(f"A = **{label_A}** | B = **{label_B}**")
 
+    # Drivers
     drivers: Dict[str, pd.DataFrame] = {}
     with st.expander("Drivers (Top 5) — decomposição Mix vs Performance"):
         for dim in METRICS_POLICY["default_driver_dimensions"]:
@@ -503,7 +444,7 @@ with right:
 # Chat
 # =========================
 st.divider()
-st.subheader("💬 Chat com o agente (consciente do IPR e do modo de comparação)")
+st.subheader("💬 Chat com o agente (consciente do IPR e das datas A/B)")
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
@@ -512,10 +453,6 @@ for m in st.session_state.messages:
 user_question = st.chat_input("Pergunte algo (ex.: 'por que o IPR caiu?')")
 
 if user_question:
-    if not api_key:
-        st.error("Defina a OPENAI_API_KEY (Secrets ou sidebar).")
-        st.stop()
-
     st.session_state.messages.append({"role": "user", "content": user_question})
     with st.chat_message("user"):
         st.markdown(user_question)
@@ -524,7 +461,7 @@ if user_question:
         llm = ChatOpenAI(
             api_key=api_key,
             model=model_name,  # gpt-3.5-turbo
-            temperature=temperature,
+            temperature=DEFAULT_TEMPERATURE,  # fixo
         )
 
         # allow_dangerous_code=True: o agente pode executar Python.
@@ -538,7 +475,6 @@ if user_question:
 
     prompt = build_agent_prompt(
         user_question=user_question,
-        comparison_mode=comparison_mode,
         label_A=label_A,
         label_B=label_B,
         summary_A=summary_A,
@@ -560,7 +496,6 @@ if user_question:
                     "Deu erro ao executar a análise.\n\n"
                     f"**Detalhes:** {e}\n\n"
                     "Dicas:\n"
-                    "- confirme se o modelo está liberado na sua conta\n"
                     "- valide se as colunas PACOTES_COLETADOS_TOTAL e FIRST_ROUTE_ID existem\n"
                     "- tente uma pergunta mais específica\n"
                 )
