@@ -1,8 +1,7 @@
 import os
 import io
 import hashlib
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -32,6 +31,8 @@ COMPARISON_LABELS = {
     "day_vs_d-7": "Dia vs D-7 (D vs D-7)",
     "week_vs_week-1": "Semana vs semana-1 (W vs W-1)",
 }
+
+DEFAULT_MODEL = "gpt-3.5-turbo"
 
 # =========================
 # App Setup
@@ -82,9 +83,7 @@ def ensure_week_iso(df: pd.DataFrame, date_col: str, week_col: str) -> pd.DataFr
     """
     out = df.copy()
     if week_col in out.columns and out[week_col].notna().any():
-        # já existe e tem conteúdo
         return out
-
     if date_col not in out.columns:
         return out
 
@@ -126,11 +125,6 @@ def iso_week_of_date(d: pd.Timestamp) -> Tuple[int, int]:
 
 
 def prev_iso_week(year: int, week: int) -> Tuple[int, int]:
-    """
-    Retorna (ano, semana) anterior ISO, lidando com virada de ano.
-    """
-    # pega segunda-feira daquela ISO-week e subtrai 7 dias
-    # (ISO week starts Monday)
     monday = pd.Timestamp.fromisocalendar(year, week, 1)
     prev = monday - pd.Timedelta(days=7)
     return iso_week_of_date(prev)
@@ -181,15 +175,8 @@ def driver_decomposition_mix_perf(
     drop_null_routes: bool = True,
 ) -> pd.DataFrame:
     """
-    Decomposição ΔIPR ≈ Δmix + Δperf por dimensão dim:
-      r_g = IPR_g = volume_g / rotas_g
-      w_g = share_rotas_g
-
-      mix_contrib  = (wA - wB) * rB
-      perf_contrib = wA * (rA - rB)
-      total_contrib = mix + perf
-
-    Retorna um dataframe com stats e contribuições por grupo.
+    Decomposição ΔIPR ≈ Δmix + Δperf por dimensão dim.
+    Retorna stats e contribuições por grupo.
     """
     def prep(df: pd.DataFrame) -> pd.DataFrame:
         dfx = df
@@ -211,28 +198,22 @@ def driver_decomposition_mix_perf(
         out["share_rotas"] = out["rotas"] / total_rotas if total_rotas > 0 else 0.0
         return out
 
-    a = prep(A).rename(columns={
-        "volume": "volume_A", "rotas": "rotas_A", "ipr": "ipr_A", "share_rotas": "wA"
-    })
-    b = prep(B).rename(columns={
-        "volume": "volume_B", "rotas": "rotas_B", "ipr": "ipr_B", "share_rotas": "wB"
-    })
+    a = prep(A).rename(columns={"volume": "volume_A", "rotas": "rotas_A", "ipr": "ipr_A", "share_rotas": "wA"})
+    b = prep(B).rename(columns={"volume": "volume_B", "rotas": "rotas_B", "ipr": "ipr_B", "share_rotas": "wB"})
 
     if a.empty and b.empty:
         return pd.DataFrame()
 
     merged = pd.merge(a, b, on=dim, how="outer")
-    for c in ["volume_A","rotas_A","ipr_A","wA","volume_B","rotas_B","ipr_B","wB"]:
+    for c in ["volume_A", "rotas_A", "ipr_A", "wA", "volume_B", "rotas_B", "ipr_B", "wB"]:
         if c not in merged.columns:
             merged[c] = 0.0
         merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
 
-    # contribuições
     merged["mix_contrib"] = (merged["wA"] - merged["wB"]) * merged["ipr_B"]
     merged["perf_contrib"] = merged["wA"] * (merged["ipr_A"] - merged["ipr_B"])
     merged["total_contrib"] = merged["mix_contrib"] + merged["perf_contrib"]
 
-    # ordena por impacto
     merged["abs_contrib"] = merged["total_contrib"].abs()
     merged = merged.sort_values("abs_contrib", ascending=False).drop(columns=["abs_contrib"])
 
@@ -258,30 +239,36 @@ def build_agent_prompt(
     drivers: Dict[str, pd.DataFrame],
     messages: List[Dict[str, str]],
 ) -> str:
-    """
-    Cria um prompt fixo que "ensina" o agente:
-    - métrica oficial IPR
-    - modo de comparação
-    - template de resposta
-    - e injeta números pré-calculados + top drivers
-    """
-    # Monta snippets compactos de drivers (top 5 por dimensão)
+    # Drivers como CSV (evita tabulate)
     driver_snippets = []
     for dim, df_dim in drivers.items():
         if df_dim is None or df_dim.empty:
             continue
         top = df_dim.head(5).copy()
-        # seleciona colunas essenciais
-        keep_cols = [dim, "total_contrib", "mix_contrib", "perf_contrib", "ipr_A", "ipr_B", "wA", "wB", "rotas_A", "rotas_B", "volume_A", "volume_B"]
+
+        keep_cols = [
+            dim,
+            "total_contrib",
+            "mix_contrib",
+            "perf_contrib",
+            "ipr_A",
+            "ipr_B",
+            "wA",
+            "wB",
+            "rotas_A",
+            "rotas_B",
+            "volume_A",
+            "volume_B",
+        ]
         keep_cols = [c for c in keep_cols if c in top.columns]
         top = top[keep_cols]
-        driver_snippets.append(f"\nDIMENSÃO: {dim}\n{top.to_string(index=False)}\n")
 
-    driver_block = "\n".join(driver_snippets).strip() if driver_snippets else "Sem drivers calculados (dimensões ausentes ou recorte vazio)."
+        driver_snippets.append(f"\nDIMENSÃO: {dim}\n{top.to_csv(index=False)}")
+
+    driver_block = "\n".join(driver_snippets).strip() if driver_snippets else "Sem drivers calculados."
 
     history_txt = format_history(messages)
 
-    # Política / SOP fixo
     sop = f"""
 Você é um analista de dados especializado nesta base (granularidade por pallet/INBOUND_ID).
 A métrica OFICIAL é:
@@ -313,7 +300,6 @@ Você já tem números pré-calculados do recorte A e B e também drivers Top 5 
 Use esses números como base e só calcule algo adicional se a pergunta pedir explicitamente.
 """.strip()
 
-    # Resumos
     def fnum(x: float) -> str:
         if x != x:  # NaN
             return "NaN"
@@ -341,7 +327,7 @@ B: volume={summary_B["volume"]:.0f}, rotas={summary_B["rotas"]:.0f}, ipr={fnum(s
 # =========================
 st.sidebar.header("Configurações")
 
-# API Key via Secrets (igual você mostrou) + fallback env + sidebar
+# API Key via Secrets (TOML) + fallback env + sidebar
 default_api_key = ""
 try:
     default_api_key = st.secrets.get("OPENAI_API_KEY", "")
@@ -358,13 +344,13 @@ api_key = st.sidebar.text_input(
     help="Recomendado: definir em Secrets (TOML): OPENAI_API_KEY = \"...\"",
 )
 
-default_model = "gpt-3.5-turbo-0613"
+# Modelo fixo (gpt-3.5-turbo) com possibilidade de override via Secrets opcional
+model_name = DEFAULT_MODEL
 try:
-    default_model = st.secrets.get("OPENAI_MODEL", default_model)
+    model_name = st.secrets.get("OPENAI_MODEL", DEFAULT_MODEL)
 except Exception:
-    pass
+    model_name = DEFAULT_MODEL
 
-model_name = st.sidebar.text_input("Modelo", value=default_model)
 temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
 
 st.sidebar.divider()
@@ -375,7 +361,7 @@ comparison_mode = st.sidebar.selectbox(
     "Modo de comparação",
     options=list(COMPARISON_LABELS.keys()),
     format_func=lambda k: COMPARISON_LABELS[k],
-    index=1,  # default: D vs D-7 (geralmente bom pra sazonalidade)
+    index=1,  # default: D vs D-7
 )
 
 st.sidebar.caption("Dica: D vs D-7 controla sazonalidade de dia da semana.")
@@ -411,16 +397,15 @@ with left:
         df = read_uploaded_dataframe(uploaded)
         st.session_state.df = df
         st.session_state.df_id = df_id
-        st.session_state.agent = None  # força recriar agente quando DF muda
+        st.session_state.agent = None  # recria agente quando DF muda
 
     df = st.session_state.df
 
     # Normalizações
     df = ensure_datetime(df, METRICS_POLICY["date_col"])
     df = ensure_week_iso(df, METRICS_POLICY["date_col"], METRICS_POLICY["week_col"])
-    st.session_state.df = df  # salva normalizado
+    st.session_state.df = df
 
-    # Informações rápidas
     st.write(f"Linhas: **{len(df):,}** | Colunas: **{df.shape[1]}**")
 
     with st.expander("Ver colunas"):
@@ -428,31 +413,35 @@ with left:
 
     st.dataframe(df.head(50), use_container_width=True)
 
-    # Controle de data de referência
+    # Data de referência
     date_col = METRICS_POLICY["date_col"]
     if date_col in df.columns and df[date_col].notna().any():
         min_date = df[date_col].min().date()
         max_date = df[date_col].max().date()
-        ref_date = st.date_input("Data de referência (para comparação)", value=max_date, min_value=min_date, max_value=max_date)
+        ref_date = st.date_input(
+            "Data de referência (para comparação)",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+        )
         ref_date_ts = pd.Timestamp(ref_date)
     else:
-        st.warning(f"Coluna de data '{date_col}' não encontrada ou inválida. Não dá pra montar comparação por tempo.")
+        st.warning(f"Coluna de data '{date_col}' não encontrada ou inválida.")
         st.stop()
 
 with right:
     st.subheader("📊 Comparação A vs B (prévia)")
     df = st.session_state.df
 
-    # Monta recortes A e B
+    # Recortes A e B
     A, B, label_A, label_B = make_period_slices(
         df=df,
         comparison_mode=comparison_mode,
-        ref_date=pd.Timestamp(ref_date_ts),
+        ref_date=ref_date_ts,
         date_col=METRICS_POLICY["date_col"],
         week_col=METRICS_POLICY["week_col"],
     )
 
-    # Sanity checks
     volume_col = METRICS_POLICY["volume_col"]
     route_col = METRICS_POLICY["route_col"]
 
@@ -464,7 +453,7 @@ with right:
 
     if volume_col in df.columns:
         if pd.to_numeric(df[volume_col], errors="coerce").fillna(0).lt(0).any() and METRICS_POLICY["guardrails"]["warn_if_negative_volume"]:
-            warnings.append(f"Há valores negativos em {volume_col} (isso costuma indicar dado inconsistente).")
+            warnings.append(f"Há valores negativos em {volume_col} (dado inconsistente).")
 
     if route_col in df.columns:
         null_rate_A = float(A[route_col].isna().mean()) if len(A) else 0.0
@@ -472,14 +461,12 @@ with right:
         if null_rate_A > 0.05 or null_rate_B > 0.05:
             warnings.append(
                 f"Alta taxa de {route_col} nulo: A={null_rate_A:.1%} | B={null_rate_B:.1%} "
-                "(isso pode distorcer o denominador de rotas)."
+                "(pode distorcer denominador)."
             )
 
-    if warnings:
-        for w in warnings:
-            st.warning(w)
+    for w in warnings:
+        st.warning(w)
 
-    # Calcula IPR A e B
     summary_A = calc_ipr(A, volume_col, route_col, drop_null_routes=METRICS_POLICY["guardrails"]["drop_null_routes"])
     summary_B = calc_ipr(B, volume_col, route_col, drop_null_routes=METRICS_POLICY["guardrails"]["drop_null_routes"])
 
@@ -487,7 +474,6 @@ with right:
     delta_vol = summary_A["volume"] - summary_B["volume"]
     delta_rot = summary_A["rotas"] - summary_B["rotas"]
 
-    # Exibe KPIs
     c1, c2, c3 = st.columns(3)
     c1.metric("IPR (A)", f"{summary_A['ipr']:.4f}" if summary_A["ipr"] == summary_A["ipr"] else "NaN", delta=f"{delta_ipr:+.4f}")
     c2.metric("Volume (A)", f"{summary_A['volume']:.0f}", delta=f"{delta_vol:+.0f}")
@@ -495,7 +481,6 @@ with right:
 
     st.caption(f"A = **{label_A}** | B = **{label_B}** | Modo: **{COMPARISON_LABELS[comparison_mode]}**")
 
-    # Calcula drivers padrão (Top 5) para ajudar a explicar ΔIPR
     drivers: Dict[str, pd.DataFrame] = {}
     with st.expander("Drivers (Top 5) — decomposição Mix vs Performance"):
         for dim in METRICS_POLICY["default_driver_dimensions"]:
@@ -503,22 +488,23 @@ with right:
                 st.info(f"Dimensão '{dim}' não existe na base — pulando.")
                 continue
             ddf = driver_decomposition_mix_perf(
-                A=A, B=B, dim=dim,
-                volume_col=volume_col, route_col=route_col,
+                A=A,
+                B=B,
+                dim=dim,
+                volume_col=volume_col,
+                route_col=route_col,
                 drop_null_routes=METRICS_POLICY["guardrails"]["drop_null_routes"],
             )
             drivers[dim] = ddf
             st.markdown(f"**{dim}**")
-            show = ddf.head(10).copy()
-            st.dataframe(show, use_container_width=True)
+            st.dataframe(ddf.head(10), use_container_width=True)
 
 # =========================
-# Chat (Agent)
+# Chat
 # =========================
 st.divider()
 st.subheader("💬 Chat com o agente (consciente do IPR e do modo de comparação)")
 
-# Render histórico
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -530,30 +516,26 @@ if user_question:
         st.error("Defina a OPENAI_API_KEY (Secrets ou sidebar).")
         st.stop()
 
-    # registra msg do usuário
     st.session_state.messages.append({"role": "user", "content": user_question})
     with st.chat_message("user"):
         st.markdown(user_question)
 
-    # cria agente se necessário
     if st.session_state.agent is None:
         llm = ChatOpenAI(
             api_key=api_key,
-            model=model_name,
+            model=model_name,  # gpt-3.5-turbo
             temperature=temperature,
         )
 
-        # IMPORTANTE: allow_dangerous_code=True permite execução de Python pelo agente (risco).
-        # Use apenas com arquivos confiáveis e, idealmente, em ambiente isolado.
+        # allow_dangerous_code=True: o agente pode executar Python.
         st.session_state.agent = create_pandas_dataframe_agent(
             llm,
             st.session_state.df,
-            agent_type="openai-functions",  # compatível com gpt-3.5-turbo-0613
+            agent_type="openai-functions",
             verbose=False,
             allow_dangerous_code=True,
         )
 
-    # prompt estruturado com SOP + métricas + drivers
     prompt = build_agent_prompt(
         user_question=user_question,
         comparison_mode=comparison_mode,
@@ -565,7 +547,6 @@ if user_question:
         messages=st.session_state.messages,
     )
 
-    # resposta
     with st.chat_message("assistant"):
         with st.spinner("Analisando..."):
             try:
@@ -579,7 +560,7 @@ if user_question:
                     "Deu erro ao executar a análise.\n\n"
                     f"**Detalhes:** {e}\n\n"
                     "Dicas:\n"
-                    "- confira se o modelo está liberado na sua conta\n"
+                    "- confirme se o modelo está liberado na sua conta\n"
                     "- valide se as colunas PACOTES_COLETADOS_TOTAL e FIRST_ROUTE_ID existem\n"
                     "- tente uma pergunta mais específica\n"
                 )
