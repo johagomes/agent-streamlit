@@ -1,7 +1,7 @@
 import os
 import io
 import hashlib
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -10,11 +10,11 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
 
+
 # =========================
-# Config / Policy (FIXO)
+# CONTRATO v1 (base nova)
 # =========================
 METRICS_POLICY = {
-    # CONTRATO v1 (base nova)
     "volume_col": "PACOTES_REAL",
     "route_col": "ROUTE_ID_REAL",
     "date_col": "DATA",
@@ -26,11 +26,11 @@ METRICS_POLICY = {
         "warn_if_routes_zero": True,
     },
 
-    # dimensões sugeridas (aparecem primeiro no seletor)
-    "suggested_dims": [
+    # ✅ As 6 dimensões (as mesmas que você citou)
+    "dims6": [
         "CLUSTER_ID",
         "HUB",
-        "TIPO_ROTA",         # ✅ no lugar de MODAL_PLAN
+        "TIPO_ROTA",
         "TRANSPORTADORA",
         "MODAL",
         "DIA_DA_SEMANA",
@@ -40,13 +40,15 @@ METRICS_POLICY = {
 DEFAULT_MODEL = "gpt-3.5-turbo"
 DEFAULT_TEMPERATURE = 0.0  # fixo (não aparece na UI)
 
+
 # =========================
 # App Setup
 # =========================
 load_dotenv()
-st.set_page_config(page_title="IPR Agent — A/B Compare", layout="wide")
+st.set_page_config(page_title="IPR Agent — 36 Tabelas Fixas", layout="wide")
 st.title("💬 IPR Agent — Pacotes por rota (IPR = Volume / Rotas)")
 st.caption("IPR (oficial) = sum(PACOTES_REAL) / COUNTD(ROUTE_ID_REAL).")
+
 
 # =========================
 # Helpers
@@ -82,12 +84,11 @@ def ensure_datetime(df: pd.DataFrame, col: str) -> pd.DataFrame:
 def ensure_week_iso(df: pd.DataFrame, date_col: str, week_col: str) -> pd.DataFrame:
     """
     Se WEEK não existir ou estiver vazio, cria como YYYY/WW (ISO) a partir de date_col.
-    Se WEEK existir (ex.: 'SEMANA'), mantém.
+    Se existir (ex.: SEMANA), mantém.
     """
     out = df.copy()
     if week_col in out.columns and out[week_col].notna().any():
         return out
-
     if date_col not in out.columns:
         return out
 
@@ -102,15 +103,39 @@ def safe_sum(series: pd.Series) -> float:
 
 
 def make_range_slice(df: pd.DataFrame, date_col: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """
-    Recorte inclusivo por intervalo [start, end] (datas normalizadas).
-    """
     s = pd.Timestamp(start).normalize()
     e = pd.Timestamp(end).normalize()
     if e < s:
         s, e = e, s
     mask = (df[date_col].dt.normalize() >= s) & (df[date_col].dt.normalize() <= e)
     return df[mask].copy()
+
+
+def infer_extra_numeric_metrics(
+    df: pd.DataFrame,
+    forbidden_cols: List[str],
+) -> List[str]:
+    """
+    Detecta colunas numéricas somáveis, excluindo colunas "proibidas" e possíveis IDs.
+    Heurística: exclui colunas com 'ID' no nome (ex.: ROUTE_ID_PLAN), e as forbidden.
+    """
+    extras: List[str] = []
+    for c in df.columns:
+        if c in forbidden_cols:
+            continue
+        uc = str(c).upper()
+
+        # Evita IDs e chaves
+        if "ID" in uc:
+            continue
+
+        # tenta converter p/ numérico
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().any():
+            extras.append(c)
+
+    # ordena de forma estável
+    return sorted(extras)
 
 
 def compute_aggregates(
@@ -123,11 +148,11 @@ def compute_aggregates(
     drop_null_routes: bool,
 ) -> pd.DataFrame:
     """
-    Retorna tabela agregada com métricas:
+    Oficiais:
       - volume: sum(volume_col)
       - rotas:  nunique(route_col)
       - ipr:    volume/rotas
-    Extras numéricas: sum(coluna)
+    Extras: sum(coluna)
     """
     dfx = df.copy()
 
@@ -204,6 +229,17 @@ def merge_and_delta(
     return m
 
 
+def totals_ipr(df: pd.DataFrame, volume_col: str, route_col: str, drop_null_routes: bool) -> Dict[str, float]:
+    dfx = df.copy()
+    if drop_null_routes and route_col in dfx.columns:
+        dfx = dfx[dfx[route_col].notna()].copy()
+
+    vol = safe_sum(dfx[volume_col]) if volume_col in dfx.columns else 0.0
+    rotas = float(dfx[route_col].nunique(dropna=True)) if route_col in dfx.columns else 0.0
+    ipr = (vol / rotas) if rotas else float("nan")
+    return {"volume": float(vol), "rotas": float(rotas), "ipr": float(ipr)}
+
+
 def format_history(messages: List[Dict[str, str]], max_turns: int = 6) -> str:
     trimmed = messages[-max_turns * 2 :]
     lines = []
@@ -219,78 +255,76 @@ def build_agent_prompt(
     label_B: str,
     totals_A: Dict[str, float],
     totals_B: Dict[str, float],
-    comparison_table: pd.DataFrame,
-    group_cols: List[str],
-    chosen_metrics: List[str],
+    tables_preview: Dict[str, pd.DataFrame],
     messages: List[Dict[str, str]],
 ) -> str:
-    table_csv = comparison_table.head(200).to_csv(index=False)
+    """
+    Para o chat: não mandamos as 36 tabelas completas (muito grande),
+    mas sim um PREVIEW top-3 de cada uma, ordenado por |ipr_delta| quando existir.
+    O agente ainda tem acesso ao df para recalcular qualquer detalhe.
+    """
+    previews_blocks = []
+    for name, t in tables_preview.items():
+        if t is None or t.empty:
+            previews_blocks.append(f"\n# {name}\n(sem linhas no recorte A/B)\n")
+            continue
+        previews_blocks.append(f"\n# {name}\n{t.to_csv(index=False)}")
 
-    sop = f"""
-Você é um analista de dados especializado nesta base.
-Métrica OFICIAL:
-- Volume = sum({METRICS_POLICY["volume_col"]})
-- Rotas  = COUNTD({METRICS_POLICY["route_col"]}) = nunique({METRICS_POLICY["route_col"]})
-- IPR    = Volume / Rotas  (Pacotes por rota)
-
-COMPARAÇÃO:
-- A = {label_A}
-- B = {label_B}
-
-Escolhas do usuário:
-- Dimensões: {group_cols if group_cols else "nenhuma (visão total)"}
-- Métricas: {chosen_metrics}
-
-REGRAS:
-1) NÃO invente colunas.
-2) NÃO chute números: use o dataframe e/ou a tabela dinâmica fornecida.
-3) Se IPR estiver nas métricas, explique o delta separando efeito de Volume vs Rotas.
-4) Formato obrigatório:
-   (1) Resumo executivo
-   (2) Comparação e filtros
-   (3) Componentes do IPR
-   (4) Deltas e ranking por dimensão
-   (5) Diagnóstico
-   (6) Próximos passos
-""".strip()
+    previews_txt = "\n".join(previews_blocks).strip()
 
     def fnum(x: float) -> str:
         if x != x:
             return "NaN"
         return f"{x:,.4f}"
 
-    totals_block = f"""
-TOTAIS (pré-calculados):
+    base = f"""
+Você é um analista de dados especializado nesta base.
+Métrica OFICIAL:
+- Volume = sum({METRICS_POLICY["volume_col"]})
+- Rotas  = COUNTD({METRICS_POLICY["route_col"]}) = nunique({METRICS_POLICY["route_col"]})
+- IPR    = Volume / Rotas
+
+Comparação por período:
+- A = {label_A}
+- B = {label_B}
+
+TOTAIS:
 A: volume={totals_A["volume"]:.0f}, rotas={totals_A["rotas"]:.0f}, ipr={fnum(totals_A["ipr"])}
 B: volume={totals_B["volume"]:.0f}, rotas={totals_B["rotas"]:.0f}, ipr={fnum(totals_B["ipr"])}
 ΔIPR = {fnum(totals_A["ipr"] - totals_B["ipr"])}
+
+IMPORTANTE:
+- Você TEM acesso ao dataframe df (granular) e pode recalcular qualquer coisa.
+- Além disso, abaixo há PREVIEWS das 36 tabelas fixas (top-3 linhas de cada), contendo A/B e deltas.
+
+Formato obrigatório:
+(1) Resumo executivo
+(2) Comparação e filtros
+(3) Componentes do IPR
+(4) Deltas e ranking por dimensão
+(5) Diagnóstico
+(6) Próximos passos
 """.strip()
 
-    history_txt = format_history(messages)
-
-    parts = [
-        sop,
-        totals_block,
-        "TABELA DINÂMICA (até 200 linhas) — contém *_A, *_B, *_delta e *_delta_pct:",
-        table_csv,
-        ("HISTÓRICO RECENTE:\n" + history_txt) if history_txt else "",
+    hist = format_history(messages)
+    prompt_parts = [
+        base,
+        "PREVIEWS DAS 36 TABELAS FIXAS (top-3 por |ipr_delta| quando houver):",
+        previews_txt,
+        ("HISTÓRICO RECENTE:\n" + hist) if hist else "",
         "PERGUNTA DO USUÁRIO:\n" + user_question,
     ]
-
-    return "\n\n".join([p for p in parts if p]).strip()
+    return "\n\n".join([p for p in prompt_parts if p]).strip()
 
 
 # =========================
 # API Key e Modelo (somente via Secrets/env) — NÃO aparece na UI
 # =========================
-load_dotenv()
-
 api_key = ""
 try:
     api_key = st.secrets.get("OPENAI_API_KEY", "")
 except Exception:
     api_key = ""
-
 if not api_key:
     api_key = os.getenv("OPENAI_API_KEY", "")
 
@@ -307,11 +341,13 @@ if not api_key:
     )
     st.stop()
 
+
 # =========================
 # Sidebar — Configurações
 # =========================
 st.sidebar.header("Configurações")
 uploaded = st.sidebar.file_uploader("Envie sua base (.csv, .xlsx, .xls)", type=["csv", "xlsx", "xls"])
+
 
 # =========================
 # Session State
@@ -324,6 +360,9 @@ if "agent" not in st.session_state:
     st.session_state.agent = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "tables36" not in st.session_state:
+    st.session_state.tables36 = {}
+
 
 # =========================
 # Load Data
@@ -339,7 +378,8 @@ if st.session_state.df is None or st.session_state.df_id != df_id:
     df = read_uploaded_dataframe(uploaded)
     st.session_state.df = df
     st.session_state.df_id = df_id
-    st.session_state.agent = None  # recria agente quando DF muda
+    st.session_state.agent = None
+    st.session_state.tables36 = {}  # invalida tabelas pré-calculadas quando muda o arquivo
 
 df = st.session_state.df
 df = ensure_datetime(df, METRICS_POLICY["date_col"])
@@ -389,58 +429,13 @@ label_B = f"{pd.Timestamp(B_start).strftime('%Y-%m-%d')} → {pd.Timestamp(B_end
 A_df = make_range_slice(df, date_col, pd.Timestamp(A_start), pd.Timestamp(A_end))
 B_df = make_range_slice(df, date_col, pd.Timestamp(B_start), pd.Timestamp(B_end))
 
-# =========================
-# Comparação dinâmica (UI)
-# =========================
-st.subheader("📊 Comparação A vs B (dinâmica)")
-
-all_cols = list(df.columns)
-
-# dimensões sugeridas primeiro
-suggested = [c for c in METRICS_POLICY["suggested_dims"] if c in all_cols]
-other_cols = [c for c in all_cols if c not in suggested]
-dim_options = suggested + other_cols
-
-# (opcional) banir MODAL_PLAN da UI por completo:
-# dim_options = [c for c in dim_options if c != "MODAL_PLAN"]
-
-group_cols = st.multiselect(
-    "Colunas de comparação (dimensões)",
-    options=dim_options,
-    default=[c for c in ["HUB", "TRANSPORTADORA"] if c in all_cols],
-    help="Escolha por quais colunas você quer comparar (ex.: HUB, TRANSPORTADORA, TIPO_ROTA).",
-)
-
-official_metric_options = ["ipr", "volume", "rotas"]
-
-# detecta colunas numéricas (somáveis) — exceto o volume base, pois já está em "volume"
-numeric_cols = []
-for c in all_cols:
-    if c == METRICS_POLICY["volume_col"]:
-        continue
-    try:
-        s = pd.to_numeric(df[c], errors="coerce")
-        if s.notna().any():
-            numeric_cols.append(c)
-    except Exception:
-        pass
-
-metric_options = official_metric_options + numeric_cols
-
-chosen_metrics = st.multiselect(
-    "Métricas para comparar",
-    options=metric_options,
-    default=["ipr", "volume", "rotas"],
-    help="Oficiais: ipr, volume, rotas. Outras colunas numéricas entram como soma.",
-)
-
-metric_keys = [m for m in chosen_metrics if m in official_metric_options]
-extra_metrics = [m for m in chosen_metrics if m not in official_metric_options]
-
 volume_col = METRICS_POLICY["volume_col"]
 route_col = METRICS_POLICY["route_col"]
 drop_null_routes = METRICS_POLICY["guardrails"]["drop_null_routes"]
 
+# =========================
+# Validações simples
+# =========================
 warnings = []
 if volume_col not in df.columns:
     warnings.append(f"Falta coluna de volume base: {volume_col}")
@@ -454,77 +449,95 @@ if volume_col in df.columns and METRICS_POLICY["guardrails"]["warn_if_negative_v
 for w in warnings:
     st.warning(w)
 
-# agrega A e B
-agg_A = compute_aggregates(
-    df=A_df,
-    group_cols=group_cols,
-    metric_keys=metric_keys,
-    extra_numeric_cols=extra_metrics,
-    volume_col=volume_col,
-    route_col=route_col,
-    drop_null_routes=drop_null_routes,
+# =========================
+# Métricas "fixas": oficiais + extras numéricas detectadas
+# =========================
+official_metric_keys = ["ipr", "volume", "rotas"]
+
+forbidden_for_extras = (
+    METRICS_POLICY["dims6"]
+    + [METRICS_POLICY["date_col"], METRICS_POLICY["week_col"], METRICS_POLICY["route_col"], METRICS_POLICY["volume_col"]]
+)
+extra_metrics = infer_extra_numeric_metrics(df, forbidden_cols=forbidden_for_extras)
+
+# As tabelas terão: oficiais + extras
+metric_cols_for_delta = official_metric_keys + extra_metrics
+
+# =========================
+# 36 tabelas fixas (6x6 pares ordenados)
+# - se d1 == d2: agrupa só por [d1]
+# - senão: agrupa por [d1, d2]
+# =========================
+dims6_present = [d for d in METRICS_POLICY["dims6"] if d in df.columns]
+if len(dims6_present) < 2:
+    st.error("Não encontrei as 6 dimensões esperadas na base. Verifique os nomes das colunas.")
+    st.stop()
+
+pairs_36: List[Tuple[str, str]] = [(d1, d2) for d1 in dims6_present for d2 in dims6_present]
+
+# Recalcula tabelas somente quando (arquivo ou período) muda
+tables_cache_key = (
+    st.session_state.df_id,
+    str(A_start),
+    str(A_end),
+    str(B_start),
+    str(B_end),
+    "|".join(dims6_present),
+    "|".join(metric_cols_for_delta),
 )
 
-agg_B = compute_aggregates(
-    df=B_df,
-    group_cols=group_cols,
-    metric_keys=metric_keys,
-    extra_numeric_cols=extra_metrics,
-    volume_col=volume_col,
-    route_col=route_col,
-    drop_null_routes=drop_null_routes,
-)
+if st.session_state.tables36.get("_cache_key") != tables_cache_key:
+    tables_full: Dict[str, pd.DataFrame] = {}
 
-metric_cols_for_delta = []
-metric_cols_for_delta.extend(metric_keys)
-metric_cols_for_delta.extend(extra_metrics)
+    for d1, d2 in pairs_36:
+        group_cols = [d1] if d1 == d2 else [d1, d2]
+        name = f"{d1} × {d2}"
 
-comparison_table = merge_and_delta(
-    agg_A=agg_A,
-    agg_B=agg_B,
-    group_cols=group_cols,
-    metric_cols=metric_cols_for_delta,
-)
+        agg_A = compute_aggregates(
+            df=A_df,
+            group_cols=group_cols,
+            metric_keys=official_metric_keys,
+            extra_numeric_cols=extra_metrics,
+            volume_col=volume_col,
+            route_col=route_col,
+            drop_null_routes=drop_null_routes,
+        )
+        agg_B = compute_aggregates(
+            df=B_df,
+            group_cols=group_cols,
+            metric_keys=official_metric_keys,
+            extra_numeric_cols=extra_metrics,
+            volume_col=volume_col,
+            route_col=route_col,
+            drop_null_routes=drop_null_routes,
+        )
+        merged = merge_and_delta(
+            agg_A=agg_A,
+            agg_B=agg_B,
+            group_cols=group_cols,
+            metric_cols=metric_cols_for_delta,
+        )
 
-# ordenação
-order_metric = st.selectbox(
-    "Ordenar por",
-    options=[f"{m}_delta" for m in metric_cols_for_delta] + [f"{m}_delta_pct" for m in metric_cols_for_delta],
-    index=0,
-)
-ascending = st.checkbox("Ordem crescente", value=False)
+        # ordena por |ipr_delta| se existir, senão por |volume_delta|
+        if "ipr_delta" in merged.columns:
+            merged["_abs_rank"] = merged["ipr_delta"].abs()
+        elif "volume_delta" in merged.columns:
+            merged["_abs_rank"] = merged["volume_delta"].abs()
+        else:
+            merged["_abs_rank"] = 0.0
 
-if order_metric in comparison_table.columns:
-    comparison_table = comparison_table.sort_values(order_metric, ascending=ascending)
+        merged = merged.sort_values("_abs_rank", ascending=False).drop(columns=["_abs_rank"], errors="ignore")
+        tables_full[name] = merged
 
-# Totais (sempre)
-tot_A = compute_aggregates(
-    df=A_df,
-    group_cols=[],
-    metric_keys=["volume", "rotas", "ipr"],
-    extra_numeric_cols=[],
-    volume_col=volume_col,
-    route_col=route_col,
-    drop_null_routes=drop_null_routes,
-)
-tot_B = compute_aggregates(
-    df=B_df,
-    group_cols=[],
-    metric_keys=["volume", "rotas", "ipr"],
-    extra_numeric_cols=[],
-    volume_col=volume_col,
-    route_col=route_col,
-    drop_null_routes=drop_null_routes,
-)
+    st.session_state.tables36 = {"_cache_key": tables_cache_key, "tables": tables_full}
+else:
+    tables_full = st.session_state.tables36["tables"]
 
-def row_to_totals(d: pd.DataFrame) -> Dict[str, float]:
-    if len(d) == 0:
-        return {"volume": 0.0, "rotas": 0.0, "ipr": float("nan")}
-    r = d.iloc[0].to_dict()
-    return {"volume": float(r.get("volume", 0.0)), "rotas": float(r.get("rotas", 0.0)), "ipr": float(r.get("ipr", float("nan")))}
-
-totals_A = row_to_totals(tot_A)
-totals_B = row_to_totals(tot_B)
+# =========================
+# KPIs topo (totais)
+# =========================
+totals_A = totals_ipr(A_df, volume_col, route_col, drop_null_routes)
+totals_B = totals_ipr(B_df, volume_col, route_col, drop_null_routes)
 
 delta_ipr = totals_A["ipr"] - totals_B["ipr"]
 delta_vol = totals_A["volume"] - totals_B["volume"]
@@ -534,23 +547,74 @@ c1, c2, c3 = st.columns(3)
 c1.metric("IPR (A)", f"{totals_A['ipr']:.4f}" if totals_A["ipr"] == totals_A["ipr"] else "NaN", delta=f"{delta_ipr:+.4f}")
 c2.metric("Volume (A)", f"{totals_A['volume']:.0f}", delta=f"{delta_vol:+.0f}")
 c3.metric("Rotas (A)", f"{totals_A['rotas']:.0f}", delta=f"{delta_rot:+.0f}")
-
 st.caption(f"A = **{label_A}** | B = **{label_B}**")
 
-st.markdown("### Tabela de comparação (A vs B + deltas)")
-st.dataframe(comparison_table, use_container_width=True)
+# =========================
+# ✅ Substitui as sessões antigas por 36 tabelas fixas
+# =========================
+st.subheader("📌 Tabelas fixas (36 combinações das 6 dimensões)")
+
+st.caption(
+    "Cada tabela contém TODAS as métricas: ipr/volume/rotas + todas as métricas numéricas detectadas (exceto IDs). "
+    "Ordem padrão: maior |ipr_delta| (ou |volume_delta| se ipr não existir)."
+)
+
+# Renderização: 36 expanders (prontos)
+# Obs: Streamlit aguenta, mas para bases grandes pode ficar pesado.
+# Se quiser performance, depois a gente troca pra 'tabs' ou 'selectbox' mantendo as tabelas fixas.
+for name in sorted(tables_full.keys()):
+    with st.expander(f"🧾 {name}", expanded=False):
+        t = tables_full[name]
+        st.dataframe(t, use_container_width=True)
+
+        # download
+        csv = t.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Baixar CSV desta tabela",
+            data=csv,
+            file_name=f"tabela_{name.replace(' × ', '_x_')}.csv",
+            mime="text/csv",
+        )
+
+# =========================
+# Previews (top-3) para o chat ler sem estourar tokens
+# =========================
+tables_preview: Dict[str, pd.DataFrame] = {}
+for name, t in tables_full.items():
+    if t is None or t.empty:
+        tables_preview[name] = t
+        continue
+
+    # Colunas principais para preview (mantém compacto)
+    preview_cols = []
+    # dims (as colunas do grupo estão presentes)
+    dims_in = [c for c in t.columns if c in name.replace(" × ", " ").split(" ")]  # simples
+    # fallback: pega as primeiras colunas não-métricas (até 2)
+    if not dims_in:
+        dims_in = [c for c in t.columns if not any(c.endswith(sfx) for sfx in ["_A", "_B", "_delta", "_delta_pct"])]
+        dims_in = dims_in[:2]
+
+    core = [
+        "ipr_A", "ipr_B", "ipr_delta",
+        "volume_A", "volume_B", "volume_delta",
+        "rotas_A", "rotas_B", "rotas_delta",
+    ]
+    preview_cols = dims_in + [c for c in core if c in t.columns]
+
+    # top-3
+    tables_preview[name] = t[preview_cols].head(3).copy()
 
 # =========================
 # Chat
 # =========================
 st.divider()
-st.subheader("💬 Chat com o agente (consciente dos períodos e da tabela dinâmica)")
+st.subheader("💬 Chat com o agente (lê as 36 tabelas fixas via previews + pode recalcular no df)")
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-user_question = st.chat_input("Pergunte algo (ex.: 'por que o IPR caiu em HUB X?')")
+user_question = st.chat_input("Pergunte algo (ex.: 'qual HUB e CLUSTER_ID mais derrubou o IPR?')")
 
 if user_question:
     st.session_state.messages.append({"role": "user", "content": user_question})
@@ -563,6 +627,8 @@ if user_question:
             model=model_name,
             temperature=DEFAULT_TEMPERATURE,
         )
+
+        # O agente tem acesso ao df (granular) para recalcular qualquer coisa.
         st.session_state.agent = create_pandas_dataframe_agent(
             llm,
             st.session_state.df,
@@ -577,9 +643,7 @@ if user_question:
         label_B=label_B,
         totals_A=totals_A,
         totals_B=totals_B,
-        comparison_table=comparison_table,
-        group_cols=group_cols,
-        chosen_metrics=chosen_metrics,
+        tables_preview=tables_preview,
         messages=st.session_state.messages,
     )
 
@@ -597,10 +661,13 @@ if user_question:
                     f"**Detalhes:** {e}\n\n"
                     "Dicas:\n"
                     "- valide se as colunas PACOTES_REAL e ROUTE_ID_REAL existem\n"
-                    "- tente uma pergunta mais específica\n"
+                    "- tente uma pergunta mais específica (cite a tabela desejada, ex.: 'HUB × CLUSTER_ID')\n"
                 )
         st.markdown(answer)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
-st.caption("Nota: o agente tem acesso ao dataframe e pode executar Python para responder. Use com cautela.")
+st.caption(
+    "Nota: para não estourar tokens, o chat recebe apenas TOP-3 de cada tabela fixa. "
+    "Se precisar de detalhes completos, o agente pode recalcular no df ou você pode citar a tabela e pedir 'detalhar top N'."
+)
