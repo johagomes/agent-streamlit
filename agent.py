@@ -1,7 +1,8 @@
 import os
 import io
+import re
 import hashlib
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -26,7 +27,7 @@ METRICS_POLICY = {
         "warn_if_routes_zero": True,
     },
 
-    # ✅ As 6 dimensões (as mesmas que você citou)
+    # 6 dimensões fixas
     "dims6": [
         "CLUSTER_ID",
         "HUB",
@@ -40,14 +41,20 @@ METRICS_POLICY = {
 DEFAULT_MODEL = "gpt-3.5-turbo"
 DEFAULT_TEMPERATURE = 0.0  # fixo (não aparece na UI)
 
+# Quantas linhas injetar no prompt (Top negativos)
+PROMPT_TOP_N = 100
+
 
 # =========================
 # App Setup
 # =========================
 load_dotenv()
-st.set_page_config(page_title="IPR Agent — 36 Tabelas Fixas", layout="wide")
-st.title("💬 IPR Agent — Pacotes por rota (IPR = Volume / Rotas)")
-st.caption("IPR (oficial) = sum(PACOTES_REAL) / COUNTD(ROUTE_ID_REAL).")
+st.set_page_config(page_title="IPR Agent — Impacto (Perf/Mix/Total) — 36 tabelas", layout="wide")
+st.title("💬 IPR Agent — Decomposição do ΔIPR (Performance + Mix) — 36 tabelas fixas")
+st.caption(
+    "IPR (oficial) = sum(PACOTES_REAL) / COUNTD(ROUTE_ID_REAL). "
+    "Decomposição midpoint/Shapley: Impacto_Performance + Impacto_Mix = Impacto_Total (fecha no ΔIPR)."
+)
 
 
 # =========================
@@ -111,48 +118,44 @@ def make_range_slice(df: pd.DataFrame, date_col: str, start: pd.Timestamp, end: 
     return df[mask].copy()
 
 
-def infer_extra_numeric_metrics(
-    df: pd.DataFrame,
-    forbidden_cols: List[str],
-) -> List[str]:
+def infer_extra_numeric_metrics(df: pd.DataFrame, forbidden_cols: List[str]) -> List[str]:
     """
-    Detecta colunas numéricas somáveis, excluindo colunas "proibidas" e possíveis IDs.
-    Heurística: exclui colunas com 'ID' no nome (ex.: ROUTE_ID_PLAN), e as forbidden.
+    Detecta colunas numéricas somáveis, excluindo:
+      - dimensões
+      - datas
+      - colunas base (volume/rota)
+      - IDs (heurística: contém 'ID' no nome)
     """
     extras: List[str] = []
     for c in df.columns:
         if c in forbidden_cols:
             continue
-        uc = str(c).upper()
 
-        # Evita IDs e chaves
+        uc = str(c).upper()
         if "ID" in uc:
             continue
 
-        # tenta converter p/ numérico
         s = pd.to_numeric(df[c], errors="coerce")
         if s.notna().any():
             extras.append(c)
 
-    # ordena de forma estável
     return sorted(extras)
 
 
 def compute_aggregates(
     df: pd.DataFrame,
     group_cols: List[str],
-    metric_keys: List[str],
-    extra_numeric_cols: List[str],
     volume_col: str,
     route_col: str,
+    extra_numeric_cols: List[str],
     drop_null_routes: bool,
 ) -> pd.DataFrame:
     """
-    Oficiais:
-      - volume: sum(volume_col)
-      - rotas:  nunique(route_col)
-      - ipr:    volume/rotas
-    Extras: sum(coluna)
+    Agrega por group_cols e calcula:
+      - volume = sum(volume_col)
+      - rotas  = nunique(route_col)
+      - ipr    = volume/rotas
+      - extras = sum(col)
     """
     dfx = df.copy()
 
@@ -168,19 +171,10 @@ def compute_aggregates(
     gb = dfx.groupby(group_cols, dropna=False)
     out = pd.DataFrame(index=gb.size().index).reset_index()
 
-    # Oficiais
-    if "volume" in metric_keys:
-        out["volume"] = gb[volume_col].apply(safe_sum).values if volume_col in dfx.columns else 0.0
+    out["volume"] = gb[volume_col].apply(safe_sum).values if volume_col in dfx.columns else 0.0
+    out["rotas"] = gb[route_col].nunique(dropna=True).values if route_col in dfx.columns else 0
+    out["ipr"] = out.apply(lambda r: (r["volume"] / r["rotas"]) if r["rotas"] else float("nan"), axis=1)
 
-    if "rotas" in metric_keys or "ipr" in metric_keys:
-        out["rotas"] = gb[route_col].nunique(dropna=True).values if route_col in dfx.columns else 0
-
-    if "ipr" in metric_keys:
-        if "volume" not in out.columns:
-            out["volume"] = gb[volume_col].apply(safe_sum).values if volume_col in dfx.columns else 0.0
-        out["ipr"] = out.apply(lambda r: (r["volume"] / r["rotas"]) if r["rotas"] else float("nan"), axis=1)
-
-    # Extras (numéricas)
     for col in extra_numeric_cols:
         out[col] = gb[col].apply(safe_sum).values if col in dfx.columns else 0.0
 
@@ -190,14 +184,9 @@ def compute_aggregates(
     return out
 
 
-def merge_and_delta(
-    agg_A: pd.DataFrame,
-    agg_B: pd.DataFrame,
-    group_cols: List[str],
-    metric_cols: List[str],
-) -> pd.DataFrame:
+def merge_A_B(agg_A: pd.DataFrame, agg_B: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
     """
-    Junta A e B e cria *_A, *_B, *_delta, *_delta_pct
+    Merge A e B com suffix _A/_B.
     """
     if not group_cols:
         agg_A["_k"] = 1
@@ -206,27 +195,36 @@ def merge_and_delta(
 
     m = pd.merge(agg_A, agg_B, on=group_cols, how="outer", suffixes=("_A", "_B"))
 
-    for col in metric_cols:
-        a = f"{col}_A"
-        b = f"{col}_B"
-        if a not in m.columns:
-            m[a] = 0.0
-        if b not in m.columns:
-            m[b] = 0.0
-
-        m[a] = pd.to_numeric(m[a], errors="coerce")
-        m[b] = pd.to_numeric(m[b], errors="coerce")
-
-        m[f"{col}_delta"] = m[a] - m[b]
-        m[f"{col}_delta_pct"] = m.apply(
-            lambda r: (r[a] / r[b] - 1.0) if pd.notna(r[b]) and r[b] not in (0, 0.0) else float("nan"),
-            axis=1,
-        )
-
     if "_k" in m.columns:
         m = m.drop(columns=["_k"], errors="ignore")
 
     return m
+
+
+def add_deltas(m: pd.DataFrame, metric_cols: List[str]) -> pd.DataFrame:
+    """
+    Cria *_delta e *_delta_pct para cada métrica em metric_cols.
+    Espera existir colunas {col}_A e {col}_B.
+    """
+    out = m.copy()
+    for col in metric_cols:
+        a = f"{col}_A"
+        b = f"{col}_B"
+
+        if a not in out.columns:
+            out[a] = 0.0
+        if b not in out.columns:
+            out[b] = 0.0
+
+        out[a] = pd.to_numeric(out[a], errors="coerce")
+        out[b] = pd.to_numeric(out[b], errors="coerce")
+
+        out[f"{col}_delta"] = out[a] - out[b]
+        out[f"{col}_delta_pct"] = out.apply(
+            lambda r: (r[a] / r[b] - 1.0) if pd.notna(r[b]) and r[b] not in (0, 0.0) else float("nan"),
+            axis=1,
+        )
+    return out
 
 
 def totals_ipr(df: pd.DataFrame, volume_col: str, route_col: str, drop_null_routes: bool) -> Dict[str, float]:
@@ -238,6 +236,62 @@ def totals_ipr(df: pd.DataFrame, volume_col: str, route_col: str, drop_null_rout
     rotas = float(dfx[route_col].nunique(dropna=True)) if route_col in dfx.columns else 0.0
     ipr = (vol / rotas) if rotas else float("nan")
     return {"volume": float(vol), "rotas": float(rotas), "ipr": float(ipr)}
+
+
+def add_shares_and_impacts_midpoint(
+    table: pd.DataFrame,
+    total_rotas_A: float,
+    total_rotas_B: float,
+) -> pd.DataFrame:
+    """
+    Midpoint/Shapley que FECHA no ΔIPR:
+      SHARE_ROTAS_A = rotas_A / total_rotas_A
+      SHARE_ROTAS_B = rotas_B / total_rotas_B
+
+      IMPACTO_PERFORMANCE = avg(share_rotas) * (IPR_A - IPR_B)
+      IMPACTO_MIX         = avg(ipr)        * (SHARE_ROTAS_A - SHARE_ROTAS_B)
+      IMPACTO_TOTAL       = PERF + MIX
+    """
+    out = table.copy()
+
+    for c in ["rotas_A", "rotas_B", "ipr_A", "ipr_B"]:
+        if c not in out.columns:
+            out[c] = 0.0
+
+    out["rotas_A"] = pd.to_numeric(out["rotas_A"], errors="coerce").fillna(0.0)
+    out["rotas_B"] = pd.to_numeric(out["rotas_B"], errors="coerce").fillna(0.0)
+    out["ipr_A"] = pd.to_numeric(out["ipr_A"], errors="coerce")
+    out["ipr_B"] = pd.to_numeric(out["ipr_B"], errors="coerce")
+
+    out["SHARE_ROTAS_A"] = (out["rotas_A"] / total_rotas_A) if total_rotas_A else 0.0
+    out["SHARE_ROTAS_B"] = (out["rotas_B"] / total_rotas_B) if total_rotas_B else 0.0
+
+    # midpoint
+    avg_share = (out["SHARE_ROTAS_A"] + out["SHARE_ROTAS_B"]) / 2.0
+    avg_ipr = (out["ipr_A"].fillna(0.0) + out["ipr_B"].fillna(0.0)) / 2.0
+
+    out["IMPACTO_PERFORMANCE"] = avg_share * (out["ipr_A"].fillna(0.0) - out["ipr_B"].fillna(0.0))
+    out["IMPACTO_MIX"] = avg_ipr * (out["SHARE_ROTAS_A"] - out["SHARE_ROTAS_B"])
+    out["IMPACTO_TOTAL"] = out["IMPACTO_PERFORMANCE"] + out["IMPACTO_MIX"]
+
+    return out
+
+
+def detect_table_name_from_text(text: str, available_names: List[str]) -> Optional[str]:
+    """
+    Identifica se o usuário citou explicitamente uma tabela (ex.: "HUB × CLUSTER_ID" ou "HUB x CLUSTER_ID").
+    """
+    t = (text or "").strip().lower()
+    t = t.replace("×", "x")
+    t = re.sub(r"\s+", " ", t)
+
+    for name in available_names:
+        n = name.lower().replace("×", "x")
+        n = re.sub(r"\s+", " ", n)
+        if n in t:
+            return name
+
+    return None
 
 
 def format_history(messages: List[Dict[str, str]], max_turns: int = 6) -> str:
@@ -255,27 +309,23 @@ def build_agent_prompt(
     label_B: str,
     totals_A: Dict[str, float],
     totals_B: Dict[str, float],
-    tables_preview: Dict[str, pd.DataFrame],
+    delta_ipr_total: float,
+    inj_global_top: pd.DataFrame,
+    inj_table_name: str,
+    inj_table_top: pd.DataFrame,
+    closure_summary: Dict[str, float],
     messages: List[Dict[str, str]],
 ) -> str:
     """
-    Para o chat: não mandamos as 36 tabelas completas (muito grande),
-    mas sim um PREVIEW top-3 de cada uma, ordenado por |ipr_delta| quando existir.
-    O agente ainda tem acesso ao df para recalcular qualquer detalhe.
+    Injeta no prompt:
+      - Resumo de fechamento: ΣPerf, ΣMix, ΣTotal, residual vs ΔIPR
+      - Top 100 global por IMPACTO_TOTAL (negativos)
+      - Se usuário citou uma tabela: Top 100 daquela tabela por IMPACTO_TOTAL (negativos)
     """
-    previews_blocks = []
-    for name, t in tables_preview.items():
-        if t is None or t.empty:
-            previews_blocks.append(f"\n# {name}\n(sem linhas no recorte A/B)\n")
-            continue
-        previews_blocks.append(f"\n# {name}\n{t.to_csv(index=False)}")
-
-    previews_txt = "\n".join(previews_blocks).strip()
-
     def fnum(x: float) -> str:
         if x != x:
             return "NaN"
-        return f"{x:,.4f}"
+        return f"{x:,.6f}"
 
     base = f"""
 Você é um analista de dados especializado nesta base.
@@ -291,30 +341,51 @@ Comparação por período:
 TOTAIS:
 A: volume={totals_A["volume"]:.0f}, rotas={totals_A["rotas"]:.0f}, ipr={fnum(totals_A["ipr"])}
 B: volume={totals_B["volume"]:.0f}, rotas={totals_B["rotas"]:.0f}, ipr={fnum(totals_B["ipr"])}
-ΔIPR = {fnum(totals_A["ipr"] - totals_B["ipr"])}
+ΔIPR_TOTAL = {fnum(delta_ipr_total)}
+
+Decomposição midpoint/Shapley por grupo (FECHA no ΔIPR):
+SHARE_ROTAS_A = rotas_grupo_A / rotas_total_A
+SHARE_ROTAS_B = rotas_grupo_B / rotas_total_B
+
+IMPACTO_PERFORMANCE = ((SHARE_ROTAS_A + SHARE_ROTAS_B)/2) * (IPR_A - IPR_B)
+IMPACTO_MIX         = ((IPR_A + IPR_B)/2) * (SHARE_ROTAS_A - SHARE_ROTAS_B)
+IMPACTO_TOTAL       = IMPACTO_PERFORMANCE + IMPACTO_MIX
+
+RESUMO DE FECHAMENTO (usando o ranking GLOBAL injetado):
+ΣPERFORMANCE = {fnum(closure_summary.get("sum_perf", float("nan")))}
+ΣMIX         = {fnum(closure_summary.get("sum_mix", float("nan")))}
+ΣTOTAL       = {fnum(closure_summary.get("sum_total", float("nan")))}
+RESIDUAL (ΔIPR - ΣTOTAL) = {fnum(closure_summary.get("residual", float("nan")))}
 
 IMPORTANTE:
-- Você TEM acesso ao dataframe df (granular) e pode recalcular qualquer coisa.
-- Além disso, abaixo há PREVIEWS das 36 tabelas fixas (top-3 linhas de cada), contendo A/B e deltas.
+- Você TEM acesso ao dataframe df (granular) e pode recalcular/validar qualquer coisa.
+- Abaixo estão rankings (Top {PROMPT_TOP_N}) com os MAIORES impactos negativos por IMPACTO_TOTAL.
 
 Formato obrigatório:
 (1) Resumo executivo
 (2) Comparação e filtros
-(3) Componentes do IPR
-(4) Deltas e ranking por dimensão
+(3) Fechamento do ΔIPR (Perf vs Mix)
+(4) Ranking por impacto (Top negativos) + recomendações
 (5) Diagnóstico
 (6) Próximos passos
 """.strip()
 
+    global_csv = inj_global_top.to_csv(index=False) if inj_global_top is not None else ""
+    table_csv = inj_table_top.to_csv(index=False) if (inj_table_top is not None and not inj_table_top.empty) else ""
+
     hist = format_history(messages)
-    prompt_parts = [
-        base,
-        "PREVIEWS DAS 36 TABELAS FIXAS (top-3 por |ipr_delta| quando houver):",
-        previews_txt,
-        ("HISTÓRICO RECENTE:\n" + hist) if hist else "",
-        "PERGUNTA DO USUÁRIO:\n" + user_question,
-    ]
-    return "\n\n".join([p for p in prompt_parts if p]).strip()
+
+    parts = [base, f"TOP {PROMPT_TOP_N} GLOBAL (pior IMPACTO_TOTAL):", global_csv]
+
+    if inj_table_name:
+        parts += [f"TOP {PROMPT_TOP_N} — {inj_table_name} (pior IMPACTO_TOTAL):", table_csv]
+
+    if hist:
+        parts.append("HISTÓRICO RECENTE:\n" + hist)
+
+    parts.append("PERGUNTA DO USUÁRIO:\n" + user_question)
+
+    return "\n\n".join([p for p in parts if p]).strip()
 
 
 # =========================
@@ -379,7 +450,7 @@ if st.session_state.df is None or st.session_state.df_id != df_id:
     st.session_state.df = df
     st.session_state.df_id = df_id
     st.session_state.agent = None
-    st.session_state.tables36 = {}  # invalida tabelas pré-calculadas quando muda o arquivo
+    st.session_state.tables36 = {}
 
 df = st.session_state.df
 df = ensure_datetime(df, METRICS_POLICY["date_col"])
@@ -394,12 +465,15 @@ if date_col not in df.columns or not df[date_col].notna().any():
 min_date = df[date_col].min().date()
 max_date = df[date_col].max().date()
 
+volume_col = METRICS_POLICY["volume_col"]
+route_col = METRICS_POLICY["route_col"]
+drop_null_routes = METRICS_POLICY["guardrails"]["drop_null_routes"]
+
 # =========================
 # Sidebar — Datas de comparação (ranges)
 # =========================
 st.sidebar.subheader("Datas de comparação (ranges)")
 
-# defaults: A últimos 7 dias, B 7 dias anteriores
 default_A_end = max_date
 default_A_start = (pd.Timestamp(max_date) - pd.Timedelta(days=6)).date()
 if default_A_start < min_date:
@@ -429,10 +503,6 @@ label_B = f"{pd.Timestamp(B_start).strftime('%Y-%m-%d')} → {pd.Timestamp(B_end
 A_df = make_range_slice(df, date_col, pd.Timestamp(A_start), pd.Timestamp(A_end))
 B_df = make_range_slice(df, date_col, pd.Timestamp(B_start), pd.Timestamp(B_end))
 
-volume_col = METRICS_POLICY["volume_col"]
-route_col = METRICS_POLICY["route_col"]
-drop_null_routes = METRICS_POLICY["guardrails"]["drop_null_routes"]
-
 # =========================
 # Validações simples
 # =========================
@@ -450,43 +520,40 @@ for w in warnings:
     st.warning(w)
 
 # =========================
-# Métricas "fixas": oficiais + extras numéricas detectadas
-# =========================
-official_metric_keys = ["ipr", "volume", "rotas"]
-
-forbidden_for_extras = (
-    METRICS_POLICY["dims6"]
-    + [METRICS_POLICY["date_col"], METRICS_POLICY["week_col"], METRICS_POLICY["route_col"], METRICS_POLICY["volume_col"]]
-)
-extra_metrics = infer_extra_numeric_metrics(df, forbidden_cols=forbidden_for_extras)
-
-# As tabelas terão: oficiais + extras
-metric_cols_for_delta = official_metric_keys + extra_metrics
-
-# =========================
-# 36 tabelas fixas (6x6 pares ordenados)
-# - se d1 == d2: agrupa só por [d1]
-# - senão: agrupa por [d1, d2]
+# Dimensões e extras numéricos
 # =========================
 dims6_present = [d for d in METRICS_POLICY["dims6"] if d in df.columns]
 if len(dims6_present) < 2:
-    st.error("Não encontrei as 6 dimensões esperadas na base. Verifique os nomes das colunas.")
+    st.error("Não encontrei as dimensões esperadas na base. Verifique os nomes das colunas.")
     st.stop()
 
+forbidden_for_extras = dims6_present + [METRICS_POLICY["date_col"], METRICS_POLICY["week_col"], route_col, volume_col]
+extra_metrics = infer_extra_numeric_metrics(df, forbidden_cols=forbidden_for_extras)
+
+# métricas que terão delta (A-B)
+metric_cols_for_delta = ["volume", "rotas", "ipr"] + extra_metrics
+
+# =========================
+# 36 tabelas fixas + impactos (Perf/Mix/Total) + fechamento
+# =========================
 pairs_36: List[Tuple[str, str]] = [(d1, d2) for d1 in dims6_present for d2 in dims6_present]
 
-# Recalcula tabelas somente quando (arquivo ou período) muda
 tables_cache_key = (
     st.session_state.df_id,
-    str(A_start),
-    str(A_end),
-    str(B_start),
-    str(B_end),
+    str(A_start), str(A_end),
+    str(B_start), str(B_end),
     "|".join(dims6_present),
     "|".join(metric_cols_for_delta),
 )
 
 if st.session_state.tables36.get("_cache_key") != tables_cache_key:
+    totals_A = totals_ipr(A_df, volume_col, route_col, drop_null_routes)
+    totals_B = totals_ipr(B_df, volume_col, route_col, drop_null_routes)
+    delta_ipr_total = float(totals_A["ipr"] - totals_B["ipr"])
+
+    total_rotas_A = float(totals_A["rotas"])
+    total_rotas_B = float(totals_B["rotas"])
+
     tables_full: Dict[str, pd.DataFrame] = {}
 
     for d1, d2 in pairs_36:
@@ -496,78 +563,144 @@ if st.session_state.tables36.get("_cache_key") != tables_cache_key:
         agg_A = compute_aggregates(
             df=A_df,
             group_cols=group_cols,
-            metric_keys=official_metric_keys,
-            extra_numeric_cols=extra_metrics,
             volume_col=volume_col,
             route_col=route_col,
+            extra_numeric_cols=extra_metrics,
             drop_null_routes=drop_null_routes,
         )
         agg_B = compute_aggregates(
             df=B_df,
             group_cols=group_cols,
-            metric_keys=official_metric_keys,
-            extra_numeric_cols=extra_metrics,
             volume_col=volume_col,
             route_col=route_col,
+            extra_numeric_cols=extra_metrics,
             drop_null_routes=drop_null_routes,
         )
-        merged = merge_and_delta(
-            agg_A=agg_A,
-            agg_B=agg_B,
-            group_cols=group_cols,
-            metric_cols=metric_cols_for_delta,
-        )
 
-        # ordena por |ipr_delta| se existir, senão por |volume_delta|
-        if "ipr_delta" in merged.columns:
-            merged["_abs_rank"] = merged["ipr_delta"].abs()
-        elif "volume_delta" in merged.columns:
-            merged["_abs_rank"] = merged["volume_delta"].abs()
-        else:
-            merged["_abs_rank"] = 0.0
+        merged = merge_A_B(agg_A, agg_B, group_cols=group_cols)
+        merged = add_deltas(merged, metric_cols=metric_cols_for_delta)
+        merged = add_shares_and_impacts_midpoint(merged, total_rotas_A=total_rotas_A, total_rotas_B=total_rotas_B)
 
-        merged = merged.sort_values("_abs_rank", ascending=False).drop(columns=["_abs_rank"], errors="ignore")
+        # Ordena por pior impacto total (mais negativo primeiro)
+        merged = merged.sort_values("IMPACTO_TOTAL", ascending=True)
         tables_full[name] = merged
 
-    st.session_state.tables36 = {"_cache_key": tables_cache_key, "tables": tables_full}
+    # Global: concatena todas as tabelas (com coluna TABELA)
+    global_rows = []
+    for name, t in tables_full.items():
+        if t is None or t.empty:
+            continue
+        temp = t.copy()
+        temp.insert(0, "TABELA", name)
+        global_rows.append(temp)
+
+    global_df = pd.concat(global_rows, ignore_index=True) if global_rows else pd.DataFrame()
+
+    # Fechamento usando a decomposição GLOBAL (uma partição das rotas por tabela/grupo)
+    # Como as 36 tabelas são visões diferentes do MESMO universo, somar as 36 duplicaria impactos.
+    # Então, para FECHAR, escolhemos UMA tabela "canônica" para o fechamento (a primeira de pares com d1==d2 por default).
+    # Ex.: HUB × HUB (ou CLUSTER_ID × CLUSTER_ID). Isso é uma partição válida do universo.
+    canonical_name = None
+    for d in dims6_present:
+        cand = f"{d} × {d}"
+        if cand in tables_full:
+            canonical_name = cand
+            break
+
+    closure = {"canonical_table": canonical_name, "sum_perf": float("nan"), "sum_mix": float("nan"), "sum_total": float("nan"), "residual": float("nan")}
+
+    if canonical_name and canonical_name in tables_full and not tables_full[canonical_name].empty:
+        canon = tables_full[canonical_name]
+        sum_perf = float(pd.to_numeric(canon["IMPACTO_PERFORMANCE"], errors="coerce").fillna(0.0).sum())
+        sum_mix = float(pd.to_numeric(canon["IMPACTO_MIX"], errors="coerce").fillna(0.0).sum())
+        sum_total = float(pd.to_numeric(canon["IMPACTO_TOTAL"], errors="coerce").fillna(0.0).sum())
+        residual = float(delta_ipr_total - sum_total)
+        closure = {"canonical_table": canonical_name, "sum_perf": sum_perf, "sum_mix": sum_mix, "sum_total": sum_total, "residual": residual}
+
+    st.session_state.tables36 = {
+        "_cache_key": tables_cache_key,
+        "tables": tables_full,
+        "global": global_df,
+        "totals_A": totals_A,
+        "totals_B": totals_B,
+        "delta_ipr_total": delta_ipr_total,
+        "closure": closure,
+        "canonical_table": canonical_name,
+    }
 else:
     tables_full = st.session_state.tables36["tables"]
+    global_df = st.session_state.tables36["global"]
+    totals_A = st.session_state.tables36["totals_A"]
+    totals_B = st.session_state.tables36["totals_B"]
+    delta_ipr_total = st.session_state.tables36["delta_ipr_total"]
+    closure = st.session_state.tables36["closure"]
+    canonical_name = st.session_state.tables36["canonical_table"]
 
 # =========================
 # KPIs topo (totais)
 # =========================
-totals_A = totals_ipr(A_df, volume_col, route_col, drop_null_routes)
-totals_B = totals_ipr(B_df, volume_col, route_col, drop_null_routes)
-
-delta_ipr = totals_A["ipr"] - totals_B["ipr"]
 delta_vol = totals_A["volume"] - totals_B["volume"]
 delta_rot = totals_A["rotas"] - totals_B["rotas"]
 
-c1, c2, c3 = st.columns(3)
-c1.metric("IPR (A)", f"{totals_A['ipr']:.4f}" if totals_A["ipr"] == totals_A["ipr"] else "NaN", delta=f"{delta_ipr:+.4f}")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("IPR (A)", f"{totals_A['ipr']:.4f}" if totals_A["ipr"] == totals_A["ipr"] else "NaN", delta=f"{delta_ipr_total:+.4f}")
 c2.metric("Volume (A)", f"{totals_A['volume']:.0f}", delta=f"{delta_vol:+.0f}")
 c3.metric("Rotas (A)", f"{totals_A['rotas']:.0f}", delta=f"{delta_rot:+.0f}")
+c4.metric("Residual fechamento", f"{closure.get('residual', float('nan')):.6f}" if closure.get("residual", 0) == closure.get("residual", 0) else "NaN")
 st.caption(f"A = **{label_A}** | B = **{label_B}**")
 
 # =========================
-# ✅ Substitui as sessões antigas por 36 tabelas fixas
+# Fechamento (canônico)
 # =========================
-st.subheader("📌 Tabelas fixas (36 combinações das 6 dimensões)")
+with st.expander("✅ Fechamento do ΔIPR (tabela canônica)", expanded=True):
+    st.markdown(
+        f"""
+**Tabela canônica usada para fechar o ΔIPR:** `{closure.get('canonical_table')}`  
+Porque: uma tabela com **DIM × DIM** particiona o universo (não duplica impactos), diferente de somar as 36 visões.
+
+- **ΔIPR_TOTAL** = `{delta_ipr_total:.6f}`
+- **Σ Impacto Performance** = `{closure.get('sum_perf', float('nan')):.6f}`
+- **Σ Impacto Mix** = `{closure.get('sum_mix', float('nan')):.6f}`
+- **Σ Impacto Total** = `{closure.get('sum_total', float('nan')):.6f}`
+- **Residual (ΔIPR - ΣTotal)** = `{closure.get('residual', float('nan')):.6f}`
+"""
+    )
+
+# =========================
+# Global Top 100 negativos (por IMPACTO_TOTAL)
+# =========================
+st.subheader(f"🔥 Global Top {PROMPT_TOP_N} impactos negativos (IMPACTO_TOTAL)")
+
+if global_df is None or global_df.empty:
+    st.info("Sem dados para ranking global.")
+else:
+    global_top = global_df.sort_values("IMPACTO_TOTAL", ascending=True).head(PROMPT_TOP_N).copy()
+
+    keep = ["TABELA"] + [d for d in dims6_present if d in global_top.columns] + [
+        "IMPACTO_TOTAL", "IMPACTO_PERFORMANCE", "IMPACTO_MIX",
+        "SHARE_ROTAS_A", "SHARE_ROTAS_B",
+        "ipr_A", "ipr_B", "ipr_delta",
+        "volume_A", "volume_B", "volume_delta",
+        "rotas_A", "rotas_B", "rotas_delta",
+    ]
+    keep = list(dict.fromkeys([c for c in keep if c in global_top.columns]))
+    st.dataframe(global_top[keep], use_container_width=True)
+
+# =========================
+# 36 tabelas fixas
+# =========================
+st.subheader("📌 36 tabelas fixas — ordenadas por pior IMPACTO_TOTAL (mais negativo)")
 
 st.caption(
-    "Cada tabela contém TODAS as métricas: ipr/volume/rotas + todas as métricas numéricas detectadas (exceto IDs). "
-    "Ordem padrão: maior |ipr_delta| (ou |volume_delta| se ipr não existir)."
+    "Cada tabela inclui volume/rotas/ipr (A e B), deltas, shares e impactos (Performance, Mix e Total). "
+    "Ordenação padrão: pior IMPACTO_TOTAL (mais negativo)."
 )
 
-# Renderização: 36 expanders (prontos)
-# Obs: Streamlit aguenta, mas para bases grandes pode ficar pesado.
-# Se quiser performance, depois a gente troca pra 'tabs' ou 'selectbox' mantendo as tabelas fixas.
 for name in sorted(tables_full.keys()):
     with st.expander(f"🧾 {name}", expanded=False):
         t = tables_full[name]
         st.dataframe(t, use_container_width=True)
 
-        # download
         csv = t.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Baixar CSV desta tabela",
@@ -577,44 +710,70 @@ for name in sorted(tables_full.keys()):
         )
 
 # =========================
-# Previews (top-3) para o chat ler sem estourar tokens
+# Injeção pro chat
 # =========================
-tables_preview: Dict[str, pd.DataFrame] = {}
-for name, t in tables_full.items():
-    if t is None or t.empty:
-        tables_preview[name] = t
-        continue
+def reduce_cols_for_prompt(df_in: pd.DataFrame, include_table_col: bool) -> pd.DataFrame:
+    if df_in is None or df_in.empty:
+        return df_in
 
-    # Colunas principais para preview (mantém compacto)
-    preview_cols = []
-    # dims (as colunas do grupo estão presentes)
-    dims_in = [c for c in t.columns if c in name.replace(" × ", " ").split(" ")]  # simples
-    # fallback: pega as primeiras colunas não-métricas (até 2)
-    if not dims_in:
-        dims_in = [c for c in t.columns if not any(c.endswith(sfx) for sfx in ["_A", "_B", "_delta", "_delta_pct"])]
-        dims_in = dims_in[:2]
+    cols = []
+    if include_table_col and "TABELA" in df_in.columns:
+        cols.append("TABELA")
 
-    core = [
+    for d in dims6_present:
+        if d in df_in.columns:
+            cols.append(d)
+
+    essentials = [
+        "IMPACTO_TOTAL", "IMPACTO_PERFORMANCE", "IMPACTO_MIX",
+        "SHARE_ROTAS_A", "SHARE_ROTAS_B",
         "ipr_A", "ipr_B", "ipr_delta",
         "volume_A", "volume_B", "volume_delta",
         "rotas_A", "rotas_B", "rotas_delta",
     ]
-    preview_cols = dims_in + [c for c in core if c in t.columns]
+    for c in essentials:
+        if c in df_in.columns:
+            cols.append(c)
 
-    # top-3
-    tables_preview[name] = t[preview_cols].head(3).copy()
+    cols = list(dict.fromkeys(cols))
+    return df_in[cols].copy()
+
+
+def make_injection_tables_for_prompt(user_text: str) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
+    available_names = list(tables_full.keys())
+    cited = detect_table_name_from_text(user_text, available_names)
+
+    # global top 100
+    if global_df is None or global_df.empty:
+        global_top = pd.DataFrame()
+    else:
+        global_top = global_df.sort_values("IMPACTO_TOTAL", ascending=True).head(PROMPT_TOP_N).copy()
+        global_top = reduce_cols_for_prompt(global_top, include_table_col=True)
+
+    # tabela específica citada
+    table_top = pd.DataFrame()
+    cited_name = ""
+    if cited and cited in tables_full:
+        cited_name = cited
+        t = tables_full[cited].sort_values("IMPACTO_TOTAL", ascending=True).head(PROMPT_TOP_N).copy()
+        table_top = reduce_cols_for_prompt(t, include_table_col=False)
+
+    return cited_name, table_top, global_top
+
 
 # =========================
 # Chat
 # =========================
 st.divider()
-st.subheader("💬 Chat com o agente (lê as 36 tabelas fixas via previews + pode recalcular no df)")
+st.subheader("💬 Chat com o agente (Modo Forte: Top 100 impactos negativos por IMPACTO_TOTAL + fechamento)")
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-user_question = st.chat_input("Pergunte algo (ex.: 'qual HUB e CLUSTER_ID mais derrubou o IPR?')")
+user_question = st.chat_input(
+    "Pergunte (ex.: 'Explique o -65 no HUB × HUB' ou 'Top 10 causas do delta global')"
+)
 
 if user_question:
     st.session_state.messages.append({"role": "user", "content": user_question})
@@ -622,13 +781,7 @@ if user_question:
         st.markdown(user_question)
 
     if st.session_state.agent is None:
-        llm = ChatOpenAI(
-            api_key=api_key,
-            model=model_name,
-            temperature=DEFAULT_TEMPERATURE,
-        )
-
-        # O agente tem acesso ao df (granular) para recalcular qualquer coisa.
+        llm = ChatOpenAI(api_key=api_key, model=model_name, temperature=DEFAULT_TEMPERATURE)
         st.session_state.agent = create_pandas_dataframe_agent(
             llm,
             st.session_state.df,
@@ -637,13 +790,28 @@ if user_question:
             allow_dangerous_code=True,
         )
 
+    cited_name, cited_top, global_top = make_injection_tables_for_prompt(user_question)
+
+    # Resumo de fechamento que vai no prompt
+    closure_summary = {
+        "sum_perf": closure.get("sum_perf", float("nan")),
+        "sum_mix": closure.get("sum_mix", float("nan")),
+        "sum_total": closure.get("sum_total", float("nan")),
+        "residual": closure.get("residual", float("nan")),
+        "canonical_table": closure.get("canonical_table", ""),
+    }
+
     prompt = build_agent_prompt(
         user_question=user_question,
         label_A=label_A,
         label_B=label_B,
         totals_A=totals_A,
         totals_B=totals_B,
-        tables_preview=tables_preview,
+        delta_ipr_total=float(delta_ipr_total),
+        inj_global_top=global_top,
+        inj_table_name=cited_name,
+        inj_table_top=cited_top,
+        closure_summary=closure_summary,
         messages=st.session_state.messages,
     )
 
@@ -660,14 +828,15 @@ if user_question:
                     "Deu erro ao executar a análise.\n\n"
                     f"**Detalhes:** {e}\n\n"
                     "Dicas:\n"
-                    "- valide se as colunas PACOTES_REAL e ROUTE_ID_REAL existem\n"
-                    "- tente uma pergunta mais específica (cite a tabela desejada, ex.: 'HUB × CLUSTER_ID')\n"
+                    "- cite uma tabela (ex.: 'HUB × HUB' ou 'HUB × CLUSTER_ID')\n"
+                    "- valide se PACOTES_REAL e ROUTE_ID_REAL existem\n"
                 )
         st.markdown(answer)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
+
 st.caption(
-    "Nota: para não estourar tokens, o chat recebe apenas TOP-3 de cada tabela fixa. "
-    "Se precisar de detalhes completos, o agente pode recalcular no df ou você pode citar a tabela e pedir 'detalhar top N'."
+    "Importante: para 'fechar o ΔIPR' você deve usar uma partição do universo (ex.: DIM×DIM como HUB×HUB). "
+    "As 36 tabelas são visões diferentes do mesmo universo — somar impactos de todas DUPLICA a explicação."
 )
